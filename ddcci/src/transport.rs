@@ -21,6 +21,16 @@ impl LinuxI2cTransport {
             dev: LinuxI2CDevice::new(path.as_ref(), 0x37)?,
         })
     }
+    pub fn probe(path: impl AsRef<Path>) -> Result<bool> {
+        let mut transport = Self::open(path)?;
+
+        let request = [0x51, 0x82, 0xf3, 0x00, 0x00, 0x00];
+
+        match transport.transact(&request) {
+            Ok(response) => Ok(!response.is_empty()),
+            Err(_) => Ok(false),
+        }
+    }
 }
 
 impl Transport for LinuxI2cTransport {

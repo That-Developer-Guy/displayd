@@ -8,7 +8,12 @@ fn main() -> anyhow::Result<()> {
 
     let brightness = device.get_vcp(Feature::Brightness)?;
 
-    println!("Current brightness: {}/{}", brightness.current, brightness.maximum);
+    println!(
+        "Current brightness: {}/{} ({:.0}%)",
+        brightness.current,
+        brightness.maximum,
+        brightness.percentage()
+    );
 
     let new_value = if brightness.current >= 50 { 25 } else { 75 };
 

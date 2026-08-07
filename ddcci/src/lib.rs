@@ -5,6 +5,7 @@ pub mod packet;
 pub mod protocol;
 pub mod transport;
 pub mod feature;
+pub mod discovery;
 
 pub use device::DdcDevice;
 pub use error::{ Error, Result };

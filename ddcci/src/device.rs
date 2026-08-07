@@ -42,12 +42,10 @@ impl<T: Transport> DdcDevice<T> {
     }
 
     pub fn set_vcp(&mut self, feature: Feature, value: u16) -> Result<()> {
-        let response = self.execute(Command::SetVcp {
+        self.execute(Command::SetVcp {
             feature,
             value,
         })?;
-
-        println!("Set response: {response:#?}");
 
         Ok(())
     }
