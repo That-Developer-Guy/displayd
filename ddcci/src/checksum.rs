@@ -4,5 +4,11 @@ pub fn calculate(bytes: &[u8]) -> u8 {
 }
 
 pub fn verify(packet: &[u8]) -> bool {
-    !packet.is_empty() && calculate(packet) == 0
+    let mut xor = 0x50; // host receive address
+
+    for b in packet {
+        xor ^= *b;
+    }
+
+    xor == 0
 }

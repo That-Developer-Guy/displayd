@@ -35,17 +35,23 @@ impl Packet {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < 4 {
+        if bytes.len() < 3 {
             return Err(Error::InvalidPacket);
         }
 
-        if !checksum::verify(bytes) {
-            return Err(Error::InvalidChecksum);
+        if bytes[0] == 0x6e {
+            if !checksum::verify(bytes) {
+                return Err(Error::InvalidChecksum);
+            }
+        } else {
+            if !checksum::verify(bytes) {
+                return Err(Error::InvalidChecksum);
+            }
         }
 
         let command = bytes[2];
 
-        let payload = bytes[3..bytes.len() - 1].to_vec();
+        let payload = if bytes.len() > 4 { bytes[3..bytes.len() - 1].to_vec() } else { Vec::new() };
 
         Ok(Self {
             command,

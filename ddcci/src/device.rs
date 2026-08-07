@@ -1,4 +1,11 @@
-use crate::{ packet::Packet, protocol::{ Command, Response }, transport::Transport, Result };
+use crate::{
+    packet::Packet,
+    protocol::{ Command, Response, VcpValue },
+    transport::Transport,
+    feature::Feature,
+    error::Error,
+    Result,
+};
 
 pub struct DdcDevice<T: Transport> {
     transport: T,
@@ -25,5 +32,37 @@ impl<T: Transport> DdcDevice<T> {
         let response = self.transact(request)?;
 
         Response::from_packet(response)
+    }
+
+    pub fn get_vcp(&mut self, feature: Feature) -> Result<VcpValue> {
+        match self.execute(Command::GetVcp(feature))? {
+            Response::Vcp(value) => Ok(value),
+            _ => Err(Error::UnexpectedResponse),
+        }
+    }
+
+    pub fn set_vcp(&mut self, feature: Feature, value: u16) -> Result<()> {
+        let response = self.execute(Command::SetVcp {
+            feature,
+            value,
+        })?;
+
+        println!("Set response: {response:#?}");
+
+        Ok(())
+    }
+
+    pub fn set_vcp_checked(&mut self, feature: Feature, value: u16) -> Result<()> {
+        let current = self.get_vcp(feature)?;
+
+        if value > current.maximum {
+            return Err(Error::ValueOutOfRange {
+                value,
+                maximum: current.maximum,
+                feature,
+            });
+        }
+
+        self.set_vcp(feature, value)
     }
 }

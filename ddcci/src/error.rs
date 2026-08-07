@@ -1,5 +1,6 @@
 use thiserror::Error;
 use i2cdev::linux::LinuxI2CError;
+use crate::feature::Feature;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -23,6 +24,12 @@ pub enum Error {
 
     #[error("Monitor did not provide a response")]
     NoResponse,
+
+    #[error("Value {value} exceeds maximum {maximum} for {feature:?}")] ValueOutOfRange {
+        value: u16,
+        maximum: u16,
+        feature: Feature,
+    },
 
     #[error("{0}")] Other(String),
 }

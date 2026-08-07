@@ -1,6 +1,4 @@
-use ddcci::packet::Packet;
-use ddcci::transport::LinuxI2cTransport;
-use ddcci::DdcDevice;
+use ddcci::{ feature::Feature, transport::LinuxI2cTransport, DdcDevice };
 
 fn main() -> anyhow::Result<()> {
     // change depending on actual path
@@ -8,11 +6,22 @@ fn main() -> anyhow::Result<()> {
 
     let mut device = DdcDevice::new(transport);
 
-    let packet = Packet::new(0x01, vec![0x10]);
+    let brightness = device.get_vcp(Feature::Brightness)?;
 
-    let reply = device.transact(packet)?;
+    println!("Current brightness: {}/{}", brightness.current, brightness.maximum);
 
-    println!("{reply:#?}");
+    let new_value = if brightness.current >= 50 { 25 } else { 75 };
+
+    device.set_vcp(Feature::Brightness, new_value)?;
+
+    let brightness = device.get_vcp(Feature::Brightness)?;
+
+    println!(
+        "New brightness: {}/{} ({:.0}%)",
+        brightness.current,
+        brightness.maximum,
+        brightness.percentage()
+    );
 
     Ok(())
 }

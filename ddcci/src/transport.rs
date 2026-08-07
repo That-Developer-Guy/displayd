@@ -25,12 +25,6 @@ impl LinuxI2cTransport {
 
 impl Transport for LinuxI2cTransport {
     fn transact(&mut self, request: &[u8]) -> Result<Vec<u8>> {
-        println!("TX:");
-        for b in request {
-            print!("{:02X} ", b);
-        }
-        println!();
-
         self.dev.write(request)?;
 
         // wait for the slow monitor
@@ -41,24 +35,18 @@ impl Transport for LinuxI2cTransport {
 
         let mut last_error = None;
 
-        for attempt in 0..5 {
+        for _attempt in 0..5 {
             match self.dev.read(&mut response) {
                 Ok(_) => {
                     if response.len() >= 3 {
                         let length = (response[1] & 0x7f) as usize;
 
-                        let total_len = length + 2;
+                        let total_len = length + 3;
 
                         if total_len <= response.len() {
                             response.truncate(total_len);
                         }
                     }
-
-                    println!("RX (attempt {}):", attempt + 1);
-                    for b in &response {
-                        print!("{:02X} ", b);
-                    }
-                    println!();
 
                     return Ok(response);
                 }
