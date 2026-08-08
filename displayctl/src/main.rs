@@ -1,12 +1,10 @@
-use anyhow::Result;
+use anyhow::{ anyhow, Result };
 
 use clap::{ Parser, Subcommand };
 
 use serde::{ Deserialize, Serialize };
 
-use std::{ io::{ BufRead, BufReader, Write }, os::unix::net::UnixStream };
-
-const SOCKET: &str = "/tmp/displayd.sock";
+use std::{ io::{ BufRead, BufReader, Write }, os::unix::net::UnixStream, path::PathBuf };
 
 #[derive(Parser)]
 #[command(name = "displayctl")]
@@ -24,41 +22,33 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Get or change brightness
     Brightness {
         #[command(subcommand)]
         action: Option<ValueCommand>,
     },
 
-    /// Get or change contrast
     Contrast {
         #[command(subcommand)]
         action: Option<ValueCommand>,
     },
 
-    /// Enable dim overlay
     Dim,
 
-    /// Disable dim overlay
     Undim,
 
-    /// Listen for display events
     Watch,
 }
 
 #[derive(Subcommand)]
 enum ValueCommand {
-    /// Set absolute value
     Set {
         value: u16,
     },
 
-    /// Increase value
     Up {
         amount: u16,
     },
 
-    /// Decrease value
     Down {
         amount: u16,
     },
@@ -80,32 +70,12 @@ struct Response {
     percentage: f32,
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
+fn socket_path() -> Result<PathBuf> {
+    let runtime_dir = std::env
+        ::var_os("XDG_RUNTIME_DIR")
+        .ok_or_else(|| { anyhow!("XDG_RUNTIME_DIR is not set") })?;
 
-    match cli.command {
-        Command::Brightness { action } => {
-            handle_feature("brightness", action, cli.verbose, cli.json)?;
-        }
-
-        Command::Contrast { action } => {
-            handle_feature("contrast", action, cli.verbose, cli.json)?;
-        }
-
-        Command::Dim => {
-            send_simple("dim")?;
-        }
-
-        Command::Undim => {
-            send_simple("restore")?;
-        }
-
-        Command::Watch => {
-            watch()?;
-        }
-    }
-
-    Ok(())
+    Ok(PathBuf::from(runtime_dir).join("displayd.sock"))
 }
 
 fn handle_feature(
@@ -181,7 +151,8 @@ fn send_simple(command: &str) -> Result<()> {
 }
 
 fn send(request: Request) -> Result<Response> {
-    let mut stream = UnixStream::connect(SOCKET)?;
+    let socket = socket_path()?;
+    let mut stream = UnixStream::connect(&socket)?;
 
     let json = serde_json::to_string(&request)?;
 
@@ -199,7 +170,8 @@ fn send(request: Request) -> Result<Response> {
 }
 
 fn watch() -> Result<()> {
-    let mut stream = UnixStream::connect(SOCKET)?;
+    let socket = socket_path()?;
+    let mut stream = UnixStream::connect(&socket)?;
 
     let request = serde_json::json!({
             "command": "subscribe"
@@ -230,4 +202,32 @@ fn print_value(value: Response, verbose: bool, json: bool) {
     } else {
         println!("{:.0}%", value.percentage);
     }
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Command::Brightness { action } => {
+            handle_feature("brightness", action, cli.verbose, cli.json)?;
+        }
+
+        Command::Contrast { action } => {
+            handle_feature("contrast", action, cli.verbose, cli.json)?;
+        }
+
+        Command::Dim => {
+            send_simple("dim")?;
+        }
+
+        Command::Undim => {
+            send_simple("restore")?;
+        }
+
+        Command::Watch => {
+            watch()?;
+        }
+    }
+
+    Ok(())
 }

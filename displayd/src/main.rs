@@ -12,8 +12,6 @@ use tokio::{
 
 use ddcci::{ discovery::find_monitor, feature::Feature, transport::LinuxI2cTransport, DdcDevice };
 
-const SOCKET: &str = "/tmp/displayd.sock";
-
 type Display = Arc<Mutex<DisplayState>>;
 
 type Ddc = DdcDevice<LinuxI2cTransport>;
@@ -415,10 +413,20 @@ async fn handle_client(stream: UnixStream, device: Display) -> Result<()> {
     Ok(())
 }
 
+fn socket_path() -> Result<PathBuf> {
+    let runtime = std::env
+        ::var_os("XDG_RUNTIME_DIR")
+        .ok_or_else(|| { anyhow!("XDG_RUNTIME_DIR is not set") })?;
+
+    Ok(PathBuf::from(runtime).join("displayd.sock"))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    if Path::new(SOCKET).exists() {
-        fs::remove_file(SOCKET)?;
+    let socket = socket_path()?;
+
+    if socket.exists() {
+        fs::remove_file(&socket)?;
     }
 
     let (path, device, brightness) = discover_and_open_monitor()?;
@@ -442,9 +450,9 @@ async fn main() -> Result<()> {
         })
     );
 
-    let listener = UnixListener::bind(SOCKET)?;
+    let listener = UnixListener::bind(&socket)?;
 
-    println!("Listening on {}", SOCKET);
+    println!("Listening on {}", socket.display());
 
     loop {
         let (stream, _) = listener.accept().await?;
