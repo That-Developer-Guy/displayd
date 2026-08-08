@@ -1,0 +1,9 @@
+[Unit]
+Description=Display control daemon
+
+[Service]
+ExecStart=%h/.local/bin/displayd
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
