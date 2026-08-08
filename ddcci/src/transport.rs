@@ -7,6 +7,11 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
+use std::path::PathBuf;
+
+use crate::device::DdcDevice;
+use crate::feature::Feature;
+
 pub trait Transport {
     fn transact(&mut self, request: &[u8]) -> Result<Vec<u8>>;
 }
@@ -15,21 +20,36 @@ pub struct LinuxI2cTransport {
     dev: LinuxI2CDevice,
 }
 
+pub struct ProbeResult {
+    pub path: PathBuf,
+    pub brightness: u16,
+}
+
 impl LinuxI2cTransport {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Ok(Self {
             dev: LinuxI2CDevice::new(path.as_ref(), 0x37)?,
         })
     }
-    pub fn probe(path: impl AsRef<Path>) -> Result<bool> {
-        let mut transport = Self::open(path)?;
+    pub fn probe(path: impl AsRef<Path>) -> Result<Option<ProbeResult>> {
+        let path = path.as_ref();
+        let transport = Self::open(path)?;
 
-        let request = [0x51, 0x82, 0xf3, 0x00, 0x00, 0x00];
+        let mut device = DdcDevice::new(transport);
 
-        match transport.transact(&request) {
-            Ok(response) => Ok(!response.is_empty()),
-            Err(_) => Ok(false),
-        }
+        let brightness = match device.get_vcp(Feature::Brightness) {
+            Ok(value) => value.current,
+            Err(_) => {
+                return Ok(None);
+            }
+        };
+
+        Ok(
+            Some(ProbeResult {
+                path: path.to_path_buf(),
+                brightness,
+            })
+        )
     }
 }
 
