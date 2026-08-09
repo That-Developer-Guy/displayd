@@ -1,17 +1,21 @@
 use anyhow::{ anyhow, Result };
 use serde::{ Deserialize, Serialize };
 
-use std::{ collections::HashMap, fs, path::PathBuf, sync::Arc, time::Instant };
+use std::{ collections::HashMap, fs, path::PathBuf, sync::Arc, thread, time::Instant };
 
 use tokio::{
     io::{ AsyncBufReadExt, AsyncWriteExt, BufReader },
     net::{ UnixListener, UnixStream },
-    sync::{ mpsc, Mutex },
+    sync::{ mpsc, oneshot },
 };
 
-use ddcci::{ discovery::find_monitors, feature::Feature, transport::LinuxI2cTransport, DdcDevice };
-
-type Display = Arc<Mutex<DisplayState>>;
+use ddcci::{
+    protocol::VcpValue,
+    discovery::find_monitors,
+    feature::Feature,
+    transport::LinuxI2cTransport,
+    DdcDevice,
+};
 
 type Ddc = DdcDevice<LinuxI2cTransport>;
 
@@ -34,7 +38,6 @@ struct Request {
 struct ListMonitor {
     index: usize,
     path: String,
-    brightness: u16,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -88,8 +91,19 @@ impl Monitor {
         })
     }
 
-    fn set_brightness_with_recovery(&mut self, hardware: u16) -> Result<()> {
-        match self.device.set_vcp(Feature::Brightness, hardware) {
+    fn get_vcp_with_recovery(&mut self, feature: Feature) -> Result<VcpValue> {
+        match self.device.get_vcp(feature) {
+            Ok(value) => Ok(value),
+            Err(first_error) => {
+                eprintln!("DDC read failed on {}: {}", self.path.display(), first_error);
+                self.reconnect()?;
+                Ok(self.device.get_vcp(feature)?)
+            }
+        }
+    }
+
+    fn set_vcp_with_recovery(&mut self, feature: Feature, value: u16) -> Result<()> {
+        match self.device.set_vcp(feature, value) {
             Ok(()) => Ok(()),
 
             Err(first_error) => {
@@ -97,7 +111,7 @@ impl Monitor {
 
                 self.reconnect()?;
 
-                self.device.set_vcp(Feature::Brightness, hardware)?;
+                self.device.set_vcp(feature, value)?;
 
                 Ok(())
             }
@@ -159,7 +173,11 @@ struct MonitorState {
 
     brightness: u16,
 
-    maximum: u16,
+    brightness_maximum: u16,
+
+    contrast: u16,
+
+    contrast_maximum: u16,
 
     modifiers: HashMap<String, f32>,
 
@@ -167,7 +185,227 @@ struct MonitorState {
 }
 
 struct DisplayState {
-    monitors: Vec<MonitorState>,
+    monitors: Vec<MonitorHandle>,
+}
+
+impl DisplayState {
+    fn get(&self, index: usize) -> Result<&MonitorHandle, String> {
+        self.monitors
+            .get(index)
+            .ok_or_else(|| {
+                format!(
+                    "Monitor {} does not exist ({} monitor(s) available)",
+                    index,
+                    self.monitors.len()
+                )
+            })
+    }
+}
+
+enum MonitorCommand {
+    Brightness {
+        id: Option<u64>,
+        value: Option<u16>,
+        reply: oneshot::Sender<Result<Message, String>>,
+    },
+
+    Contrast {
+        id: Option<u64>,
+        value: Option<u16>,
+        reply: oneshot::Sender<Result<Message, String>>,
+    },
+
+    Dim {
+        id: Option<u64>,
+        name: String,
+        factor: f32,
+        reply: oneshot::Sender<Result<Message, String>>,
+    },
+
+    Restore {
+        id: Option<u64>,
+        name: String,
+        reply: oneshot::Sender<Result<Message, String>>,
+    },
+
+    Subscribe {
+        id: Option<u64>,
+        sender: mpsc::UnboundedSender<Message>,
+        reply: oneshot::Sender<Result<Message, String>>,
+    },
+
+    Info {
+        reply: oneshot::Sender<Result<ListMonitor, String>>,
+    },
+}
+
+struct MonitorHandle {
+    index: usize,
+    tx: mpsc::Sender<MonitorCommand>,
+}
+
+impl MonitorHandle {
+    async fn send(&self, command: MonitorCommand) -> Result<(), String> {
+        self.tx.send(command).await.map_err(|_| "Monitor worker has stopped".to_string())
+    }
+}
+
+fn monitor_worker(index: usize, mut state: MonitorState, mut rx: mpsc::Receiver<MonitorCommand>) {
+    println!("Monitor worker {} started for {}", index, state.monitor.path.display());
+
+    while let Some(command) = rx.blocking_recv() {
+        match command {
+            MonitorCommand::Brightness { id, value, reply } => {
+                let result = handle_brightness(&mut state, id, value);
+
+                let _ = reply.send(result);
+            }
+
+            MonitorCommand::Contrast { id, value, reply } => {
+                let result = handle_contrast(&mut state, id, value);
+
+                let _ = reply.send(result);
+            }
+
+            MonitorCommand::Dim { id, name, factor, reply } => {
+                let result = handle_dim(&mut state, id, name, factor);
+
+                let _ = reply.send(result);
+            }
+
+            MonitorCommand::Restore { id, name, reply } => {
+                let result = handle_restore(&mut state, id, name);
+
+                let _ = reply.send(result);
+            }
+
+            MonitorCommand::Subscribe { id, sender, reply } => {
+                state.subscribers.push(sender);
+
+                let result = Ok(response(id, state.brightness, state.brightness_maximum));
+
+                let _ = reply.send(result);
+            }
+
+            MonitorCommand::Info { reply } => {
+                let result = Ok(ListMonitor {
+                    index,
+                    path: state.monitor.path.display().to_string(),
+                });
+
+                let _ = reply.send(result);
+            }
+        }
+    }
+
+    println!("Monitor worker {} stopped", index);
+}
+
+fn handle_brightness(
+    state: &mut MonitorState,
+    id: Option<u64>,
+    value: Option<u16>
+) -> Result<Message, String> {
+    if let Some(value) = value {
+        if value > state.brightness_maximum {
+            return Err(format!("brightness must be between 0 and {}", state.brightness_maximum));
+        }
+
+        let old_brightness = state.brightness;
+
+        state.brightness = value;
+
+        if let Err(error) = apply_brightness(state) {
+            state.brightness = old_brightness;
+
+            return Err(error.to_string());
+        }
+
+        notify(state, "brightness_changed");
+    }
+
+    Ok(response(id, state.brightness, state.brightness_maximum))
+}
+
+fn handle_contrast(
+    state: &mut MonitorState,
+    id: Option<u64>,
+    value: Option<u16>
+) -> Result<Message, String> {
+    if let Some(value) = value {
+        if value > state.contrast_maximum {
+            return Err(format!("contrast must be between 0 and {}", state.contrast_maximum));
+        }
+
+        let old_contrast = state.contrast;
+
+        state.contrast = value;
+
+        if let Err(error) = state.monitor.set_vcp_with_recovery(Feature::Contrast, value) {
+            state.contrast = old_contrast;
+
+            return Err(error.to_string());
+        }
+
+        notify(state, "contrast_changed");
+    }
+
+    Ok(response(id, state.contrast, state.contrast_maximum))
+}
+
+fn handle_dim(
+    state: &mut MonitorState,
+    id: Option<u64>,
+    name: String,
+    factor: f32
+) -> Result<Message, String> {
+    if !factor.is_finite() {
+        return Err("factor must be finite".to_string());
+    }
+
+    if factor < 0.0 {
+        return Err("factor must not be negative".to_string());
+    }
+
+    let old_factor = state.modifiers.insert(name.clone(), factor);
+
+    if let Err(error) = apply_brightness(state) {
+        match old_factor {
+            Some(old_factor) => {
+                state.modifiers.insert(name, old_factor);
+            }
+
+            None => {
+                state.modifiers.remove(&name);
+            }
+        }
+
+        return Err(error.to_string());
+    }
+
+    notify(state, "dim_changed");
+
+    Ok(response(id, state.brightness, state.brightness_maximum))
+}
+
+fn handle_restore(
+    state: &mut MonitorState,
+    id: Option<u64>,
+    name: String
+) -> Result<Message, String> {
+    let old_factor = state.modifiers.remove(&name);
+
+    if let Err(error) = apply_brightness(state) {
+        if let Some(old_factor) = old_factor {
+            state.modifiers.insert(name, old_factor);
+        }
+
+        return Err(error.to_string());
+    }
+
+    notify(state, "restore");
+
+    Ok(response(id, state.brightness, state.brightness_maximum))
 }
 
 fn cache_path() -> Result<PathBuf> {
@@ -227,13 +465,23 @@ fn save_cached_paths(paths: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-fn monitor_state_from_probe(path: PathBuf, brightness: u16, maximum: u16) -> Result<MonitorState> {
-    let monitor = Monitor::from_discovery(path)?;
+fn monitor_state_from_probe(
+    path: PathBuf,
+    brightness: u16,
+    brightness_maximum: u16
+) -> Result<MonitorState> {
+    let mut monitor = Monitor::from_discovery(path)?;
+
+    let contrast = monitor.get_vcp_with_recovery(Feature::Contrast)?;
+
+    println!("Current contrast: {}/{}", contrast.current, contrast.maximum);
 
     Ok(MonitorState {
         monitor,
         brightness,
-        maximum,
+        brightness_maximum,
+        contrast: contrast.current,
+        contrast_maximum: contrast.maximum,
         modifiers: HashMap::new(),
         subscribers: Vec::new(),
     })
@@ -263,7 +511,7 @@ fn discover_monitors() -> Result<Vec<MonitorState>> {
                         monitor_state_from_probe(
                             path.clone(),
                             discovered.brightness,
-                            discovered.maximum
+                            discovered.brightness_maximum
                         )?
                     );
 
@@ -314,7 +562,11 @@ fn discover_monitors() -> Result<Vec<MonitorState>> {
         let path = discovered.path.clone();
 
         monitors.push(
-            monitor_state_from_probe(path.clone(), discovered.brightness, discovered.maximum)?
+            monitor_state_from_probe(
+                path.clone(),
+                discovered.brightness,
+                discovered.brightness_maximum
+            )?
         );
 
         paths.push(path);
@@ -330,13 +582,13 @@ fn discover_monitors() -> Result<Vec<MonitorState>> {
 fn effective_brightness(state: &MonitorState) -> u16 {
     let factor: f32 = state.modifiers.values().product();
 
-    ((state.brightness as f32) * factor).round().clamp(0.0, state.maximum as f32) as u16
+    ((state.brightness as f32) * factor).round().clamp(0.0, state.brightness_maximum as f32) as u16
 }
 
 fn apply_brightness(state: &mut MonitorState) -> Result<()> {
     let hardware = effective_brightness(state);
 
-    state.monitor.set_brightness_with_recovery(hardware)?;
+    state.monitor.set_vcp_with_recovery(Feature::Brightness, hardware)?;
 
     Ok(())
 }
@@ -351,75 +603,61 @@ fn notify(state: &mut MonitorState, name: &str) {
     state.subscribers.retain(|subscriber| subscriber.send(event.clone()).is_ok());
 }
 
-fn brightness_percentage(state: &MonitorState) -> f32 {
-    if state.maximum == 0 {
-        return 0.0;
-    }
-    ((state.brightness as f32) / (state.maximum as f32)) * 100.0
-}
-
-fn response(id: Option<u64>, state: &MonitorState) -> Message {
+fn response(id: Option<u64>, current: u16, maximum: u16) -> Message {
     Message::Response {
         id,
-        current: state.brightness,
-        maximum: state.maximum,
-        percentage: brightness_percentage(state),
+        current,
+        maximum,
+        percentage: if maximum == 0 {
+            0.0
+        } else {
+            ((current as f32) / (maximum as f32)) * 100.0
+        },
     }
 }
 
-fn list_response(state: &DisplayState) -> Message {
-    let monitors = state.monitors
-        .iter()
-        .enumerate()
-        .map(|(index, monitor)| ListMonitor {
-            index,
-            path: monitor.monitor.path.display().to_string(),
-            brightness: monitor.brightness,
-        })
-        .collect();
-
-    Message::List { monitors }
-}
-
-async fn execute(request: Request, device: Display) -> Result<Message> {
-    let mut state = device.lock().await;
-
-    let id = request.id;
-
+async fn execute(request: Request, display: Arc<DisplayState>) -> Result<Message> {
     if request.command == "list" {
-        return Ok(list_response(&state));
+        return list_monitors(&display).await;
     }
 
     let index = request.monitor.unwrap_or(0);
 
-    let monitor_count = state.monitors.len();
+    let monitor = display.get(index).map_err(|error| anyhow!(error))?;
 
-    let monitor = state.monitors
-        .get_mut(index)
-        .ok_or_else(|| {
-            anyhow!("Monitor {} does not exist ({} monitor(s) available)", index, monitor_count)
-        })?;
+    let id = request.id;
 
     match request.command.as_str() {
         "brightness" => {
-            if let Some(value) = request.value {
-                if value > monitor.maximum {
-                    return Err(anyhow!("brightness must be between 0 and {}", monitor.maximum));
-                }
+            let (reply_tx, reply_rx) = oneshot::channel();
 
-                let old_brightness = monitor.brightness;
+            monitor
+                .send(MonitorCommand::Brightness {
+                    id,
+                    value: request.value,
+                    reply: reply_tx,
+                }).await
+                .map_err(|error| anyhow!(error))?;
 
-                monitor.brightness = value;
+            reply_rx.await
+                .map_err(|_| anyhow!("Monitor worker stopped"))?
+                .map_err(|error| anyhow!(error))
+        }
 
-                if let Err(error) = apply_brightness(monitor) {
-                    monitor.brightness = old_brightness;
-                    return Err(error);
-                }
+        "contrast" => {
+            let (reply_tx, reply_rx) = oneshot::channel();
 
-                notify(monitor, "brightness_changed");
-            }
+            monitor
+                .send(MonitorCommand::Contrast {
+                    id,
+                    value: request.value,
+                    reply: reply_tx,
+                }).await
+                .map_err(|error| anyhow!(error))?;
 
-            Ok(response(id, monitor))
+            reply_rx.await
+                .map_err(|_| anyhow!("Monitor worker stopped"))?
+                .map_err(|error| anyhow!(error))
         }
 
         "dim" => {
@@ -435,42 +673,64 @@ async fn execute(request: Request, device: Display) -> Result<Message> {
                 return Err(anyhow!("factor must not be negative"));
             }
 
-            let old_factor = monitor.modifiers.insert(name.clone(), factor);
-            if let Err(error) = apply_brightness(monitor) {
-                match old_factor {
-                    Some(old_factor) => {
-                        monitor.modifiers.insert(name, old_factor);
-                    }
-                    None => {
-                        monitor.modifiers.remove(&name);
-                    }
-                }
-                return Err(error);
-            }
+            let (reply_tx, reply_rx) = oneshot::channel();
 
-            notify(monitor, "dim_changed");
+            monitor
+                .send(MonitorCommand::Dim {
+                    id,
+                    name,
+                    factor,
+                    reply: reply_tx,
+                }).await
+                .map_err(|error| anyhow!(error))?;
 
-            Ok(response(id, monitor))
+            reply_rx.await
+                .map_err(|_| anyhow!("Monitor worker stopped"))?
+                .map_err(|error| anyhow!(error))
         }
 
         "restore" => {
             let name = request.name.unwrap_or_else(|| "default".into());
 
-            let old_factor = monitor.modifiers.remove(&name);
-            if let Err(error) = apply_brightness(monitor) {
-                if let Some(old_factor) = old_factor {
-                    monitor.modifiers.insert(name, old_factor);
-                }
-                return Err(error);
-            }
+            let (reply_tx, reply_rx) = oneshot::channel();
 
-            notify(monitor, "restore");
+            monitor
+                .send(MonitorCommand::Restore {
+                    id,
+                    name,
+                    reply: reply_tx,
+                }).await
+                .map_err(|error| anyhow!(error))?;
 
-            Ok(response(id, monitor))
+            reply_rx.await
+                .map_err(|_| anyhow!("Monitor worker stopped"))?
+                .map_err(|error| anyhow!(error))
         }
 
         _ => Err(anyhow!("Unknown command: {}", request.command)),
     }
+}
+
+async fn list_monitors(display: &DisplayState) -> Result<Message> {
+    let mut monitors = Vec::with_capacity(display.monitors.len());
+
+    for monitor in &display.monitors {
+        let (reply_tx, reply_rx) = oneshot::channel();
+
+        monitor
+            .send(MonitorCommand::Info {
+                reply: reply_tx,
+            }).await
+            .map_err(|error| anyhow!(error))?;
+
+        let info = reply_rx.await
+            .map_err(|_| anyhow!("Monitor worker stopped"))?
+            .map_err(|error| anyhow!(error))?;
+
+        monitors.push(info);
+    }
+
+    Ok(Message::List { monitors })
 }
 
 async fn write_message(
@@ -485,7 +745,7 @@ async fn write_message(
     Ok(())
 }
 
-async fn handle_client(stream: UnixStream, device: Display) -> Result<()> {
+async fn handle_client(stream: UnixStream, display: Arc<DisplayState>) -> Result<()> {
     let (read, mut write) = stream.into_split();
 
     let mut reader = BufReader::new(read);
@@ -507,28 +767,23 @@ async fn handle_client(stream: UnixStream, device: Display) -> Result<()> {
     if request.command == "subscribe" {
         let index = request.monitor.unwrap_or(0);
 
+        let monitor = display.get(index).map_err(|error| anyhow!(error))?;
+
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let initial_response = {
-            let mut state = device.lock().await;
+        let (reply_tx, reply_rx) = oneshot::channel();
 
-            let monitor_count = state.monitors.len();
+        monitor
+            .send(MonitorCommand::Subscribe {
+                id: request.id,
+                sender: tx,
+                reply: reply_tx,
+            }).await
+            .map_err(|error| anyhow!(error))?;
 
-            let monitor = state.monitors
-                .get_mut(index)
-                .ok_or_else(|| {
-                    anyhow!(
-                        "Monitor {} does not exist \
-                         ({} monitor(s) available)",
-                        index,
-                        monitor_count
-                    )
-                })?;
-
-            monitor.subscribers.push(tx);
-
-            response(request.id, monitor)
-        };
+        let initial_response = reply_rx.await
+            .map_err(|_| anyhow!("Monitor worker stopped"))?
+            .map_err(|error| anyhow!(error))?;
 
         println!("New subscriber for monitor {}", index);
 
@@ -553,7 +808,7 @@ async fn handle_client(stream: UnixStream, device: Display) -> Result<()> {
 
     let request_id = request.id;
 
-    match execute(request, device).await {
+    match execute(request, display).await {
         Ok(response) => {
             println!("Command completed in {:?}", start.elapsed());
 
@@ -565,7 +820,6 @@ async fn handle_client(stream: UnixStream, device: Display) -> Result<()> {
 
             let response = Message::Error {
                 id: request_id,
-
                 error: error.to_string(),
             };
 
@@ -592,15 +846,31 @@ async fn main() -> Result<()> {
         fs::remove_file(&socket)?;
     }
 
-    let monitors = discover_monitors()?;
+    let monitors = tokio::task::spawn_blocking(discover_monitors).await??;
 
     println!("Using {} monitor(s)", monitors.len());
 
-    let state = Arc::new(
-        Mutex::new(DisplayState {
-            monitors,
-        })
-    );
+    let mut handles = Vec::with_capacity(monitors.len());
+
+    for (index, monitor_state) in monitors.into_iter().enumerate() {
+        let (tx, rx) = mpsc::channel::<MonitorCommand>(32);
+
+        thread::Builder
+            ::new()
+            .name(format!("displayd-monitor-{}", index))
+            .spawn(move || {
+                monitor_worker(index, monitor_state, rx);
+            })?;
+
+        handles.push(MonitorHandle {
+            index,
+            tx,
+        });
+    }
+
+    let display = Arc::new(DisplayState {
+        monitors: handles,
+    });
 
     let listener = UnixListener::bind(&socket)?;
 
@@ -609,10 +879,10 @@ async fn main() -> Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
 
-        let state = state.clone();
+        let display = Arc::clone(&display);
 
         tokio::spawn(async move {
-            if let Err(error) = handle_client(stream, state).await {
+            if let Err(error) = handle_client(stream, display).await {
                 eprintln!("client error: {}", error);
             }
         });

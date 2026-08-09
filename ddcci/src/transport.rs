@@ -23,7 +23,7 @@ pub struct LinuxI2cTransport {
 pub struct ProbeResult {
     pub path: PathBuf,
     pub brightness: u16,
-    pub maximum: u16,
+    pub brightness_maximum: u16,
 }
 
 impl LinuxI2cTransport {
@@ -49,7 +49,7 @@ impl LinuxI2cTransport {
             Some(ProbeResult {
                 path: path.to_path_buf(),
                 brightness: brightness.current,
-                maximum: brightness.maximum,
+                brightness_maximum: brightness.maximum,
             })
         )
     }
