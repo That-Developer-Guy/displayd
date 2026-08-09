@@ -403,13 +403,18 @@ async fn execute(request: Request, device: Display) -> Result<Message> {
     match request.command.as_str() {
         "brightness" => {
             if let Some(value) = request.value {
-                if value > 100 {
-                    return Err(anyhow!("brightness must be between 0 and 100"));
+                if value > monitor.maximum {
+                    return Err(anyhow!("brightness must be between 0 and {}", monitor.maximum));
                 }
 
-                apply_brightness(monitor)?;
+                let old_brightness = monitor.brightness;
 
                 monitor.brightness = value;
+
+                if let Err(error) = apply_brightness(monitor) {
+                    monitor.brightness = old_brightness;
+                    return Err(error);
+                }
 
                 notify(monitor, "brightness_changed");
             }
@@ -430,9 +435,18 @@ async fn execute(request: Request, device: Display) -> Result<Message> {
                 return Err(anyhow!("factor must not be negative"));
             }
 
-            apply_brightness(monitor)?;
-
-            monitor.modifiers.insert(name, factor);
+            let old_factor = monitor.modifiers.insert(name.clone(), factor);
+            if let Err(error) = apply_brightness(monitor) {
+                match old_factor {
+                    Some(old_factor) => {
+                        monitor.modifiers.insert(name, old_factor);
+                    }
+                    None => {
+                        monitor.modifiers.remove(&name);
+                    }
+                }
+                return Err(error);
+            }
 
             notify(monitor, "dim_changed");
 
@@ -442,9 +456,13 @@ async fn execute(request: Request, device: Display) -> Result<Message> {
         "restore" => {
             let name = request.name.unwrap_or_else(|| "default".into());
 
-            apply_brightness(monitor)?;
-
-            monitor.modifiers.remove(&name);
+            let old_factor = monitor.modifiers.remove(&name);
+            if let Err(error) = apply_brightness(monitor) {
+                if let Some(old_factor) = old_factor {
+                    monitor.modifiers.insert(name, old_factor);
+                }
+                return Err(error);
+            }
 
             notify(monitor, "restore");
 
