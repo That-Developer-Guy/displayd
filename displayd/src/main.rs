@@ -1,8 +1,7 @@
 use anyhow::{ anyhow, Result };
-
 use serde::{ Deserialize, Serialize };
 
-use std::{ collections::HashMap, fs, path::{ Path, PathBuf }, sync::Arc, time::Instant };
+use std::{ collections::HashMap, fs, path::PathBuf, sync::Arc, time::Instant };
 
 use tokio::{
     io::{ AsyncBufReadExt, AsyncWriteExt, BufReader },
@@ -10,7 +9,7 @@ use tokio::{
     sync::{ mpsc, Mutex },
 };
 
-use ddcci::{ discovery::find_monitor, feature::Feature, transport::LinuxI2cTransport, DdcDevice };
+use ddcci::{ discovery::find_monitors, feature::Feature, transport::LinuxI2cTransport, DdcDevice };
 
 type Display = Arc<Mutex<DisplayState>>;
 
@@ -20,6 +19,8 @@ type Ddc = DdcDevice<LinuxI2cTransport>;
 struct Request {
     id: Option<u64>,
 
+    monitor: Option<usize>,
+
     command: String,
 
     value: Option<u16>,
@@ -27,6 +28,13 @@ struct Request {
     name: Option<String>,
 
     factor: Option<f32>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct ListMonitor {
+    index: usize,
+    path: String,
+    brightness: u16,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -51,6 +59,10 @@ enum Message {
         effective: u16,
     },
 
+    #[serde(rename = "list")] List {
+        monitors: Vec<ListMonitor>,
+    },
+
     #[serde(rename = "error")] Error {
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<u64>,
@@ -65,22 +77,6 @@ struct Monitor {
 }
 
 impl Monitor {
-    fn open(path: PathBuf) -> Result<(Self, u16)> {
-        let transport = LinuxI2cTransport::open(path.clone())?;
-
-        let mut device = DdcDevice::new(transport);
-
-        let brightness = device.get_vcp(Feature::Brightness)?.current;
-
-        Ok((
-            Self {
-                path,
-                device,
-            },
-            brightness,
-        ))
-    }
-
     fn from_discovery(path: PathBuf) -> Result<Self> {
         let transport = LinuxI2cTransport::open(path.clone())?;
 
@@ -109,20 +105,56 @@ impl Monitor {
     }
 
     fn reconnect(&mut self) -> Result<()> {
-        eprintln!("Rediscovering monitor...");
+        let original_path = self.path.clone();
 
-        let (path, device, _brightness) = discover_and_open_monitor()?;
+        eprintln!("Reconnecting monitor {}...", original_path.display());
 
-        println!("Using monitor: {}", path.display());
+        match LinuxI2cTransport::probe(&original_path) {
+            Ok(Some(_discovered)) => {
+                let monitor = Monitor::from_discovery(original_path.clone())?;
+
+                self.path = monitor.path;
+                self.device = monitor.device;
+
+                println!("Reconnected monitor: {}", original_path.display());
+
+                return Ok(());
+            }
+
+            Ok(None) => {
+                eprintln!("No DDC/CI monitor found at {}", original_path.display());
+            }
+
+            Err(error) => {
+                eprintln!("Probe failed for {}: {}", original_path.display(), error);
+            }
+        }
+
+        eprintln!("Performing full monitor discovery...");
+
+        let discovered = find_monitors()?;
+
+        let discovered = discovered
+            .into_iter()
+            .find(|monitor| monitor.path == original_path)
+            .ok_or_else(|| {
+                anyhow!("Could not rediscover monitor {}", original_path.display())
+            })?;
+
+        let path = discovered.path.clone();
+
+        let monitor = Monitor::from_discovery(path.clone())?;
+
+        println!("Rediscovered monitor: {}", path.display());
 
         self.path = path;
-        self.device = device;
+        self.device = monitor.device;
 
         Ok(())
     }
 }
 
-struct DisplayState {
+struct MonitorState {
     monitor: Monitor,
 
     brightness: u16,
@@ -130,6 +162,10 @@ struct DisplayState {
     modifiers: HashMap<String, f32>,
 
     subscribers: Vec<mpsc::UnboundedSender<Message>>,
+}
+
+struct DisplayState {
+    monitors: Vec<MonitorState>,
 }
 
 fn cache_path() -> Result<PathBuf> {
@@ -141,83 +177,152 @@ fn cache_path() -> Result<PathBuf> {
         return Err(anyhow!("Could not determine cache directory"));
     };
 
-    Ok(base.join("displayd").join("monitor"))
+    Ok(base.join("displayd").join("monitors"))
 }
 
-fn load_cached_path() -> Option<PathBuf> {
-    let cache = cache_path().ok()?;
+fn load_cached_paths() -> Vec<PathBuf> {
+    let cache = match cache_path() {
+        Ok(path) => path,
+        Err(_) => {
+            return Vec::new();
+        }
+    };
 
-    let contents = fs::read_to_string(cache).ok()?;
+    let contents = match fs::read_to_string(cache) {
+        Ok(contents) => contents,
+        Err(_) => {
+            return Vec::new();
+        }
+    };
 
-    let path = PathBuf::from(contents.trim());
-
-    if path.as_os_str().is_empty() {
-        return None;
-    }
-
-    Some(path)
+    contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .collect()
 }
 
-fn save_cached_path(path: &Path) -> Result<()> {
+fn save_cached_paths(paths: &[PathBuf]) -> Result<()> {
     let cache = cache_path()?;
 
     let parent = cache.parent().ok_or_else(|| anyhow!("Invalid cache path"))?;
 
     fs::create_dir_all(parent)?;
 
-    let temporary = parent.join("monitor.tmp");
+    let temporary = parent.join("monitors.tmp");
 
-    fs::write(&temporary, format!("{}\n", path.display()))?;
+    let contents = paths
+        .iter()
+        .map(|path| path.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    fs::write(&temporary, format!("{}\n", contents))?;
 
     fs::rename(temporary, cache)?;
 
     Ok(())
 }
 
-fn discover_and_open_monitor() -> Result<(PathBuf, Ddc, u16)> {
-    if let Some(path) = load_cached_path() {
-        println!("Trying cached monitor: {}", path.display());
+fn monitor_state_from_probe(path: PathBuf, brightness: u16) -> Result<MonitorState> {
+    let monitor = Monitor::from_discovery(path)?;
 
-        match Monitor::open(path.clone()) {
-            Ok((monitor, brightness)) => {
-                println!("Cached monitor is valid: {}", path.display());
+    Ok(MonitorState {
+        monitor,
+        brightness,
+        modifiers: HashMap::new(),
+        subscribers: Vec::new(),
+    })
+}
 
-                return Ok((monitor.path, monitor.device, brightness));
-            }
+fn discover_monitors() -> Result<Vec<MonitorState>> {
+    let cached_paths = load_cached_paths();
 
-            Err(error) => {
-                eprintln!("Cached monitor failed: {}", error);
+    if !cached_paths.is_empty() {
+        println!("Trying {} cached monitor(s)...", cached_paths.len());
 
-                eprintln!("Performing full monitor discovery...");
+        let mut monitors = Vec::new();
+        let mut valid_paths = Vec::new();
+
+        for path in cached_paths {
+            println!("Probing cached monitor: {}", path.display());
+
+            match LinuxI2cTransport::probe(&path) {
+                Ok(Some(discovered)) => {
+                    println!("Cached monitor is valid: {}", discovered.path.display());
+
+                    println!("Current brightness: {}", discovered.brightness);
+
+                    let path = discovered.path.clone();
+
+                    monitors.push(monitor_state_from_probe(path.clone(), discovered.brightness)?);
+
+                    valid_paths.push(path);
+                }
+
+                Ok(None) => {
+                    eprintln!("Cached device is not a DDC/CI monitor: {}", path.display());
+                }
+
+                Err(error) => {
+                    eprintln!("Cached monitor failed: {}: {}", path.display(), error);
+                }
             }
         }
+
+        if !monitors.is_empty() {
+            if let Err(error) = save_cached_paths(&valid_paths) {
+                eprintln!("Failed to update monitor cache: {}", error);
+            }
+
+            return Ok(monitors);
+        }
+
+        eprintln!(
+            "No cached monitors could be opened; \
+             performing full monitor discovery..."
+        );
     } else {
-        println!("No cached monitor found; performing discovery...");
+        println!("No cached monitors found; \
+             performing full monitor discovery...");
     }
 
-    let discovered = find_monitor()?.ok_or_else(|| { anyhow!("No DDC/CI monitor found") })?;
+    let discovered = find_monitors()?;
 
-    println!("Found monitor: {}", discovered.path.display());
+    if discovered.is_empty() {
+        return Err(anyhow!("No DDC/CI monitors found"));
+    }
 
-    println!("Current brightness: {}", discovered.brightness);
+    let mut monitors = Vec::with_capacity(discovered.len());
+    let mut paths = Vec::with_capacity(discovered.len());
 
-    // no brightness query -> already done from the probe request
-    let monitor = Monitor::from_discovery(discovered.path.clone())?;
+    for (index, discovered) in discovered.into_iter().enumerate() {
+        println!("Found monitor {}: {}", index, discovered.path.display());
 
-    if let Err(error) = save_cached_path(&discovered.path) {
+        println!("Current brightness: {}", discovered.brightness);
+
+        let path = discovered.path.clone();
+
+        monitors.push(monitor_state_from_probe(path.clone(), discovered.brightness)?);
+
+        paths.push(path);
+    }
+
+    if let Err(error) = save_cached_paths(&paths) {
         eprintln!("Failed to update monitor cache: {}", error);
     }
 
-    Ok((monitor.path, monitor.device, discovered.brightness))
+    Ok(monitors)
 }
 
-fn effective_brightness(state: &DisplayState) -> u16 {
+fn effective_brightness(state: &MonitorState) -> u16 {
     let factor: f32 = state.modifiers.values().product();
 
     ((state.brightness as f32) * factor).round().clamp(0.0, 100.0) as u16
 }
 
-fn apply_brightness(state: &mut DisplayState) -> Result<()> {
+fn apply_brightness(state: &mut MonitorState) -> Result<()> {
     let hardware = effective_brightness(state);
 
     state.monitor.set_brightness_with_recovery(hardware)?;
@@ -225,16 +330,37 @@ fn apply_brightness(state: &mut DisplayState) -> Result<()> {
     Ok(())
 }
 
-fn notify(state: &mut DisplayState, name: &str) {
+fn notify(state: &mut MonitorState, name: &str) {
     let event = Message::Event {
         event: name.to_string(),
-
         current: state.brightness,
-
         effective: effective_brightness(state),
     };
 
-    state.subscribers.retain(|subscriber| { subscriber.send(event.clone()).is_ok() });
+    state.subscribers.retain(|subscriber| subscriber.send(event.clone()).is_ok());
+}
+
+fn response(id: Option<u64>, state: &MonitorState) -> Message {
+    Message::Response {
+        id,
+        current: state.brightness,
+        maximum: 100,
+        percentage: state.brightness as f32,
+    }
+}
+
+fn list_response(state: &DisplayState) -> Message {
+    let monitors = state.monitors
+        .iter()
+        .enumerate()
+        .map(|(index, monitor)| ListMonitor {
+            index,
+            path: monitor.monitor.path.display().to_string(),
+            brightness: monitor.brightness,
+        })
+        .collect();
+
+    Message::List { monitors }
 }
 
 async fn execute(request: Request, device: Display) -> Result<Message> {
@@ -242,25 +368,35 @@ async fn execute(request: Request, device: Display) -> Result<Message> {
 
     let id = request.id;
 
+    if request.command == "list" {
+        return Ok(list_response(&state));
+    }
+
+    let index = request.monitor.unwrap_or(0);
+
+    let monitor_count = state.monitors.len();
+
+    let monitor = state.monitors
+        .get_mut(index)
+        .ok_or_else(|| {
+            anyhow!("Monitor {} does not exist ({} monitor(s) available)", index, monitor_count)
+        })?;
+
     match request.command.as_str() {
         "brightness" => {
             if let Some(value) = request.value {
-                state.brightness = value;
+                if value > 100 {
+                    return Err(anyhow!("brightness must be between 0 and 100"));
+                }
 
-                apply_brightness(&mut state)?;
+                monitor.brightness = value;
 
-                notify(&mut state, "brightness_changed");
+                apply_brightness(monitor)?;
+
+                notify(monitor, "brightness_changed");
             }
 
-            Ok(Message::Response {
-                id,
-
-                current: state.brightness,
-
-                maximum: 100,
-
-                percentage: state.brightness as f32,
-            })
+            Ok(response(id, monitor))
         }
 
         "dim" => {
@@ -272,44 +408,32 @@ async fn execute(request: Request, device: Display) -> Result<Message> {
                 return Err(anyhow!("factor must be finite"));
             }
 
-            state.modifiers.insert(name, factor);
+            if factor < 0.0 {
+                return Err(anyhow!("factor must not be negative"));
+            }
 
-            apply_brightness(&mut state)?;
+            monitor.modifiers.insert(name, factor);
 
-            notify(&mut state, "dim_changed");
+            apply_brightness(monitor)?;
 
-            Ok(Message::Response {
-                id,
+            notify(monitor, "dim_changed");
 
-                current: state.brightness,
-
-                maximum: 100,
-
-                percentage: state.brightness as f32,
-            })
+            Ok(response(id, monitor))
         }
 
         "restore" => {
             let name = request.name.unwrap_or_else(|| "default".into());
 
-            state.modifiers.remove(&name);
+            monitor.modifiers.remove(&name);
 
-            apply_brightness(&mut state)?;
+            apply_brightness(monitor)?;
 
-            notify(&mut state, "restore");
+            notify(monitor, "restore");
 
-            Ok(Message::Response {
-                id,
-
-                current: state.brightness,
-
-                maximum: 100,
-
-                percentage: state.brightness as f32,
-            })
+            Ok(response(id, monitor))
         }
 
-        _ => { Err(anyhow!("Unknown command: {}", request.command)) }
+        _ => Err(anyhow!("Unknown command: {}", request.command)),
     }
 }
 
@@ -320,7 +444,6 @@ async fn write_message(
     let json = serde_json::to_string(message)?;
 
     write.write_all(json.as_bytes()).await?;
-
     write.write_all(b"\n").await?;
 
     Ok(())
@@ -343,48 +466,52 @@ async fn handle_client(stream: UnixStream, device: Display) -> Result<()> {
 
     let request: Request = serde_json
         ::from_str(&line)
-        .map_err(|error| { anyhow!("Invalid request: {}", error) })?;
+        .map_err(|error| anyhow!("Invalid request: {}", error))?;
 
     if request.command == "subscribe" {
+        let index = request.monitor.unwrap_or(0);
+
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        {
+        let initial_response = {
             let mut state = device.lock().await;
 
-            state.subscribers.push(tx);
-        }
+            let monitor_count = state.monitors.len();
 
-        println!("New subscriber");
+            let monitor = state.monitors
+                .get_mut(index)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Monitor {} does not exist \
+                         ({} monitor(s) available)",
+                        index,
+                        monitor_count
+                    )
+                })?;
 
-        write_message(
-            &mut write,
-            &(Message::Response {
-                id: request.id,
+            monitor.subscribers.push(tx);
 
-                current: {
-                    let state = device.lock().await;
+            response(request.id, monitor)
+        };
 
-                    state.brightness
-                },
+        println!("New subscriber for monitor {}", index);
 
-                maximum: 100,
-
-                percentage: {
-                    let state = device.lock().await;
-
-                    state.brightness as f32
-                },
-            })
-        ).await?;
+        write_message(&mut write, &initial_response).await?;
 
         while let Some(event) = rx.recv().await {
-            write_message(&mut write, &event).await?;
+            if let Err(error) = write_message(&mut write, &event).await {
+                eprintln!("Subscriber for monitor {} disconnected: {}", index, error);
+
+                break;
+            }
         }
 
         return Ok(());
     }
 
-    println!("Executing {}", request.command);
+    let monitor_text = request.monitor.map(|index| index.to_string()).unwrap_or_else(|| "0".into());
+
+    println!("Executing {} on monitor {}", request.command, monitor_text);
 
     let start = Instant::now();
 
@@ -416,7 +543,7 @@ async fn handle_client(stream: UnixStream, device: Display) -> Result<()> {
 fn socket_path() -> Result<PathBuf> {
     let runtime = std::env
         ::var_os("XDG_RUNTIME_DIR")
-        .ok_or_else(|| { anyhow!("XDG_RUNTIME_DIR is not set") })?;
+        .ok_or_else(|| anyhow!("XDG_RUNTIME_DIR is not set"))?;
 
     Ok(PathBuf::from(runtime).join("displayd.sock"))
 }
@@ -429,24 +556,13 @@ async fn main() -> Result<()> {
         fs::remove_file(&socket)?;
     }
 
-    let (path, device, brightness) = discover_and_open_monitor()?;
+    let monitors = discover_monitors()?;
 
-    println!("Using monitor: {}", path.display());
-
-    let monitor = Monitor {
-        path,
-        device,
-    };
+    println!("Using {} monitor(s)", monitors.len());
 
     let state = Arc::new(
         Mutex::new(DisplayState {
-            monitor,
-
-            brightness,
-
-            modifiers: HashMap::new(),
-
-            subscribers: Vec::new(),
+            monitors,
         })
     );
 

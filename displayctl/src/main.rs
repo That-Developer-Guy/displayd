@@ -6,10 +6,26 @@ use serde::{ Deserialize, Serialize };
 
 use std::{ io::{ BufRead, BufReader, Write }, os::unix::net::UnixStream, path::PathBuf };
 
+#[derive(Debug, Deserialize, Serialize)]
+struct ListMonitor {
+    index: usize,
+    path: String,
+    brightness: u16,
+}
+
 #[derive(Parser)]
 #[command(name = "displayctl")]
 #[command(about = "Control DDC/CI displays")]
 struct Cli {
+    #[arg(
+        short = 'm',
+        long = "monitor",
+        default_value_t = 0,
+        global = true,
+        help = "Monitor index (zero-based)"
+    )]
+    monitor: usize,
+
     #[arg(short, long, help = "Show detailed output")]
     verbose: bool,
 
@@ -37,6 +53,8 @@ enum Command {
     Undim,
 
     Watch,
+
+    List,
 }
 
 #[derive(Subcommand)]
@@ -58,6 +76,8 @@ enum ValueCommand {
 struct Request {
     command: String,
 
+    monitor: Option<usize>,
+
     value: Option<u16>,
 }
 
@@ -70,10 +90,28 @@ struct Response {
     percentage: f32,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum Message {
+    #[serde(rename = "response")] Response {
+        current: u16,
+        maximum: u16,
+        percentage: f32,
+    },
+
+    #[serde(rename = "list")] List {
+        monitors: Vec<ListMonitor>,
+    },
+
+    #[serde(rename = "error")] Error {
+        error: String,
+    },
+}
+
 fn socket_path() -> Result<PathBuf> {
     let runtime_dir = std::env
         ::var_os("XDG_RUNTIME_DIR")
-        .ok_or_else(|| { anyhow!("XDG_RUNTIME_DIR is not set") })?;
+        .ok_or_else(|| anyhow!("XDG_RUNTIME_DIR is not set"))?;
 
     Ok(PathBuf::from(runtime_dir).join("displayd.sock"))
 }
@@ -81,13 +119,15 @@ fn socket_path() -> Result<PathBuf> {
 fn handle_feature(
     command: &str,
     action: Option<ValueCommand>,
+    monitor: usize,
     verbose: bool,
     json: bool
 ) -> Result<()> {
     match action {
         None => {
-            let response = send(Request {
+            let response = send_response(Request {
                 command: command.into(),
+                monitor: Some(monitor),
                 value: None,
             })?;
 
@@ -95,8 +135,9 @@ fn handle_feature(
         }
 
         Some(ValueCommand::Set { value }) => {
-            let response = send(Request {
+            let response = send_response(Request {
                 command: command.into(),
+                monitor: Some(monitor),
                 value: Some(value),
             })?;
 
@@ -104,15 +145,17 @@ fn handle_feature(
         }
 
         Some(ValueCommand::Up { amount }) => {
-            let current = send(Request {
+            let current = send_response(Request {
                 command: command.into(),
+                monitor: Some(monitor),
                 value: None,
             })?;
 
-            let value = (current.current + amount).min(current.maximum);
+            let value = current.current.saturating_add(amount).min(current.maximum);
 
-            let response = send(Request {
+            let response = send_response(Request {
                 command: command.into(),
+                monitor: Some(monitor),
                 value: Some(value),
             })?;
 
@@ -120,15 +163,17 @@ fn handle_feature(
         }
 
         Some(ValueCommand::Down { amount }) => {
-            let current = send(Request {
+            let current = send_response(Request {
                 command: command.into(),
+                monitor: Some(monitor),
                 value: None,
             })?;
 
             let value = current.current.saturating_sub(amount);
 
-            let response = send(Request {
+            let response = send_response(Request {
                 command: command.into(),
+                monitor: Some(monitor),
                 value: Some(value),
             })?;
 
@@ -139,9 +184,10 @@ fn handle_feature(
     Ok(())
 }
 
-fn send_simple(command: &str) -> Result<()> {
-    let response = send(Request {
+fn send_simple(command: &str, monitor: usize) -> Result<()> {
+    let response = send_response(Request {
         command: command.into(),
+        monitor: Some(monitor),
         value: None,
     })?;
 
@@ -150,7 +196,23 @@ fn send_simple(command: &str) -> Result<()> {
     Ok(())
 }
 
-fn send(request: Request) -> Result<Response> {
+fn send_list() -> Result<Vec<ListMonitor>> {
+    match
+        send(Request {
+            command: "list".into(),
+            monitor: None,
+            value: None,
+        })?
+    {
+        Message::List { monitors } => Ok(monitors),
+
+        Message::Error { error } => { Err(anyhow!("{}", error)) }
+
+        other => { Err(anyhow!("Unexpected response from daemon: {:?}", other)) }
+    }
+}
+
+fn send(request: Request) -> Result<Message> {
     let socket = socket_path()?;
     let mut stream = UnixStream::connect(&socket)?;
 
@@ -166,16 +228,37 @@ fn send(request: Request) -> Result<Response> {
 
     reader.read_line(&mut line)?;
 
-    Ok(serde_json::from_str(&line)?)
+    if line.trim().is_empty() {
+        return Err(anyhow!("Daemon returned an empty response"));
+    }
+
+    serde_json::from_str(&line).map_err(|error| anyhow!("Invalid response from daemon: {}", error))
 }
 
-fn watch() -> Result<()> {
+fn send_response(request: Request) -> Result<Response> {
+    match send(request)? {
+        Message::Response { current, maximum, percentage } =>
+            Ok(Response {
+                current,
+                maximum,
+                percentage,
+            }),
+
+        Message::Error { error } => { Err(anyhow!("{}", error)) }
+
+        other => { Err(anyhow!("Unexpected response from daemon: {:?}", other)) }
+    }
+}
+
+fn watch(monitor: usize) -> Result<()> {
     let socket = socket_path()?;
     let mut stream = UnixStream::connect(&socket)?;
 
-    let request = serde_json::json!({
-            "command": "subscribe"
-        });
+    let request =
+        serde_json::json!({
+        "command": "subscribe",
+        "monitor": monitor,
+    });
 
     stream.write_all(request.to_string().as_bytes())?;
 
@@ -185,6 +268,36 @@ fn watch() -> Result<()> {
 
     for line in reader.lines() {
         println!("{}", line?);
+    }
+
+    Ok(())
+}
+
+fn list(verbose: bool, json: bool) -> Result<()> {
+    let monitors = send_list()?;
+
+    if monitors.is_empty() {
+        if json {
+            println!("[]");
+        } else {
+            println!("No DDC/CI monitors found.");
+        }
+
+        return Ok(());
+    }
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&monitors)?);
+
+        return Ok(());
+    }
+
+    for monitor in monitors {
+        if verbose {
+            println!("{}: {} (brightness: {}%)", monitor.index, monitor.path, monitor.brightness);
+        } else {
+            println!("{}: {}", monitor.index, monitor.path);
+        }
     }
 
     Ok(())
@@ -209,23 +322,27 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Brightness { action } => {
-            handle_feature("brightness", action, cli.verbose, cli.json)?;
+            handle_feature("brightness", action, cli.monitor, cli.verbose, cli.json)?;
         }
 
         Command::Contrast { action } => {
-            handle_feature("contrast", action, cli.verbose, cli.json)?;
+            handle_feature("contrast", action, cli.monitor, cli.verbose, cli.json)?;
         }
 
         Command::Dim => {
-            send_simple("dim")?;
+            send_simple("dim", cli.monitor)?;
         }
 
         Command::Undim => {
-            send_simple("restore")?;
+            send_simple("restore", cli.monitor)?;
         }
 
         Command::Watch => {
-            watch()?;
+            watch(cli.monitor)?;
+        }
+
+        Command::List => {
+            list(cli.verbose, cli.json)?;
         }
     }
 
