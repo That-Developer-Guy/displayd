@@ -1,6 +1,7 @@
 # displayd
 
 A small Rust library with a daemon and CLI for controlling external monitors. VESA DDC/CI support is required.
+`displayd` is primarily designed to make monitor brightness control feel fast and responsive. Existing tools such as `ddcutil` can introduce enough latency for interactive brightness changes to feel sluggish. `displayd` aims to solve this by providing a persistent, low-latency service for communicating with monitors, while also establishing a system that is not limited to CLI-based control. Its architecture is intended to be embeddable in other applications as well, while exposing monitor state changes, particularly brightness changes, as events.
 
 ## Installation
 
