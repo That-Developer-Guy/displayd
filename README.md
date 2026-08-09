@@ -26,9 +26,9 @@ Download `displayd`, `displayctl`, and `displayd.service` from the desired relea
 For example, using `wget`:
 
 ```bash
-wget https://github.com/That-Developer-Guy/displayd/releases/download/v0.1.0/displayd
-wget https://github.com/That-Developer-Guy/displayd/releases/download/v0.1.0/displayctl
-wget https://github.com/That-Developer-Guy/displayd/releases/download/v0.1.0/displayd.service
+wget https://github.com/That-Developer-Guy/displayd/releases/latest/download/displayd
+wget https://github.com/That-Developer-Guy/displayd/releases/latest/download/displayctl
+wget https://github.com/That-Developer-Guy/displayd/releases/latest/download/displayd.service
 ```
 
 ### 2. Install the binaries
@@ -181,6 +181,31 @@ cp displayd.service ~/.config/systemd/user/displayd.service
 systemctl --user daemon-reload
 systemctl --user enable --now displayd.service
 ```
+
+## Usage
+
+```text
+Control DDC/CI displays
+
+Usage: displayctl [OPTIONS] <COMMAND>
+
+Commands:
+  brightness  Show and modify the brightness level
+  contrast    Show and modify the contrast level
+  dim         Apply dim (10% of brightness level)
+  undim       Reset dim (10% of brightness level)
+  watch       Listen for display changes
+  list        List available monitors
+  help        Print this message or the help of the given subcommand(s)
+
+Options:
+  -m, --monitor <MONITOR>  Monitor index (zero-based) [default: 0]
+  -v, --verbose            Show detailed output
+      --json               Output JSON
+  -h, --help               Print help
+```
+
+Alternatively, run `displayctl --help` for more information.
 
 ## Contributions and Issues
 

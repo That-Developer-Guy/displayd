@@ -38,40 +38,51 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Show and modify the brightness level
     Brightness {
         #[command(subcommand)]
         action: Option<ValueCommand>,
     },
 
+    /// Show and modify the contrast level
     Contrast {
         #[command(subcommand)]
         action: Option<ValueCommand>,
     },
 
+    /// Apply dim (10% of brightness level)
     Dim,
 
+    /// Reset dim (10% of brightness level)
     Undim,
 
+    /// Listen for display changes
     Watch,
 
+    /// List available monitors
     List,
 }
 
 #[derive(Subcommand)]
 enum ValueCommand {
+    /// Set the value directly
     Set {
+        /// Value to set
         value: u16,
     },
 
+    /// Increase the value
     Up {
+        /// Amount to increase by
         amount: u16,
     },
 
+    /// Decrease the value
     Down {
+        /// Amount to decrease by
         amount: u16,
     },
 }
-
 #[derive(Debug, Serialize)]
 struct Request {
     command: String,
