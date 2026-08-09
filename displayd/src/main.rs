@@ -159,6 +159,8 @@ struct MonitorState {
 
     brightness: u16,
 
+    maximum: u16,
+
     modifiers: HashMap<String, f32>,
 
     subscribers: Vec<mpsc::UnboundedSender<Message>>,
@@ -225,12 +227,13 @@ fn save_cached_paths(paths: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-fn monitor_state_from_probe(path: PathBuf, brightness: u16) -> Result<MonitorState> {
+fn monitor_state_from_probe(path: PathBuf, brightness: u16, maximum: u16) -> Result<MonitorState> {
     let monitor = Monitor::from_discovery(path)?;
 
     Ok(MonitorState {
         monitor,
         brightness,
+        maximum,
         modifiers: HashMap::new(),
         subscribers: Vec::new(),
     })
@@ -256,7 +259,13 @@ fn discover_monitors() -> Result<Vec<MonitorState>> {
 
                     let path = discovered.path.clone();
 
-                    monitors.push(monitor_state_from_probe(path.clone(), discovered.brightness)?);
+                    monitors.push(
+                        monitor_state_from_probe(
+                            path.clone(),
+                            discovered.brightness,
+                            discovered.maximum
+                        )?
+                    );
 
                     valid_paths.push(path);
                 }
@@ -304,7 +313,9 @@ fn discover_monitors() -> Result<Vec<MonitorState>> {
 
         let path = discovered.path.clone();
 
-        monitors.push(monitor_state_from_probe(path.clone(), discovered.brightness)?);
+        monitors.push(
+            monitor_state_from_probe(path.clone(), discovered.brightness, discovered.maximum)?
+        );
 
         paths.push(path);
     }
@@ -319,7 +330,7 @@ fn discover_monitors() -> Result<Vec<MonitorState>> {
 fn effective_brightness(state: &MonitorState) -> u16 {
     let factor: f32 = state.modifiers.values().product();
 
-    ((state.brightness as f32) * factor).round().clamp(0.0, 100.0) as u16
+    ((state.brightness as f32) * factor).round().clamp(0.0, state.maximum as f32) as u16
 }
 
 fn apply_brightness(state: &mut MonitorState) -> Result<()> {
@@ -340,12 +351,19 @@ fn notify(state: &mut MonitorState, name: &str) {
     state.subscribers.retain(|subscriber| subscriber.send(event.clone()).is_ok());
 }
 
+fn brightness_percentage(state: &MonitorState) -> f32 {
+    if state.maximum == 0 {
+        return 0.0;
+    }
+    ((state.brightness as f32) / (state.maximum as f32)) * 100.0
+}
+
 fn response(id: Option<u64>, state: &MonitorState) -> Message {
     Message::Response {
         id,
         current: state.brightness,
-        maximum: 100,
-        percentage: state.brightness as f32,
+        maximum: state.maximum,
+        percentage: brightness_percentage(state),
     }
 }
 
@@ -389,9 +407,9 @@ async fn execute(request: Request, device: Display) -> Result<Message> {
                     return Err(anyhow!("brightness must be between 0 and 100"));
                 }
 
-                monitor.brightness = value;
-
                 apply_brightness(monitor)?;
+
+                monitor.brightness = value;
 
                 notify(monitor, "brightness_changed");
             }
@@ -412,9 +430,9 @@ async fn execute(request: Request, device: Display) -> Result<Message> {
                 return Err(anyhow!("factor must not be negative"));
             }
 
-            monitor.modifiers.insert(name, factor);
-
             apply_brightness(monitor)?;
+
+            monitor.modifiers.insert(name, factor);
 
             notify(monitor, "dim_changed");
 
@@ -424,9 +442,9 @@ async fn execute(request: Request, device: Display) -> Result<Message> {
         "restore" => {
             let name = request.name.unwrap_or_else(|| "default".into());
 
-            monitor.modifiers.remove(&name);
-
             apply_brightness(monitor)?;
+
+            monitor.modifiers.remove(&name);
 
             notify(monitor, "restore");
 

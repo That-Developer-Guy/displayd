@@ -23,6 +23,7 @@ pub struct LinuxI2cTransport {
 pub struct ProbeResult {
     pub path: PathBuf,
     pub brightness: u16,
+    pub maximum: u16,
 }
 
 impl LinuxI2cTransport {
@@ -38,7 +39,7 @@ impl LinuxI2cTransport {
         let mut device = DdcDevice::new(transport);
 
         let brightness = match device.get_vcp(Feature::Brightness) {
-            Ok(value) => value.current,
+            Ok(value) => value,
             Err(_) => {
                 return Ok(None);
             }
@@ -47,7 +48,8 @@ impl LinuxI2cTransport {
         Ok(
             Some(ProbeResult {
                 path: path.to_path_buf(),
-                brightness,
+                brightness: brightness.current,
+                maximum: brightness.maximum,
             })
         )
     }
