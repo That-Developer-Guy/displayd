@@ -1,7 +1,9 @@
 use anyhow::{ anyhow, Result };
 use serde::{ Deserialize, Serialize };
 
-use std::{ collections::HashMap, fs, path::PathBuf, sync::Arc, thread, time::Instant };
+use std::{ collections::HashMap, fs, path::{ Path, PathBuf }, sync::Arc, thread, time::Instant };
+
+use edid::{ parse::{ parse as parse_edid, EdidData }, read::read_edid };
 
 use tokio::{
     io::{ AsyncBufReadExt, AsyncWriteExt, BufReader },
@@ -10,9 +12,9 @@ use tokio::{
 };
 
 use ddcci::{
-    protocol::VcpValue,
     discovery::find_monitors,
     feature::Feature,
+    protocol::VcpValue,
     transport::LinuxI2cTransport,
     DdcDevice,
 };
@@ -23,7 +25,7 @@ type Ddc = DdcDevice<LinuxI2cTransport>;
 struct Request {
     id: Option<u64>,
 
-    monitor: Option<usize>,
+    monitor: Option<String>,
 
     command: String,
 
@@ -36,8 +38,13 @@ struct Request {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct ListMonitor {
-    index: usize,
+    connector: String,
+
     path: String,
+
+    name: Option<String>,
+
+    id: MonitorId,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -74,7 +81,37 @@ enum Message {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+struct MonitorId {
+    manufacturer: String,
+    product: u16,
+    serial: Option<u32>,
+}
+
+impl MonitorId {
+    fn from_edid(edid: &EdidData) -> Result<Self> {
+        Ok(Self {
+            manufacturer: edid.id.clone(),
+            product: edid.product_code,
+            serial: Some(edid.serial_number),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedMonitor {
+    connector: String,
+
+    path: PathBuf,
+}
+
 struct Monitor {
+    id: MonitorId,
+
+    connector: String,
+
+    name: Option<String>,
+
     path: PathBuf,
     device: Ddc,
 }
@@ -82,10 +119,18 @@ struct Monitor {
 impl Monitor {
     fn from_discovery(path: PathBuf) -> Result<Self> {
         let transport = LinuxI2cTransport::open(path.clone())?;
-
         let device = DdcDevice::new(transport);
 
+        let edid_bytes = read_edid(&path)?;
+        let edid = parse_edid(&edid_bytes)?;
+
+        let id = MonitorId::from_edid(&edid)?;
+        let connector = find_drm_connector(&edid_bytes);
+
         Ok(Self {
+            id,
+            connector: connector?,
+            name: edid.name,
             path,
             device,
         })
@@ -120,19 +165,43 @@ impl Monitor {
 
     fn reconnect(&mut self) -> Result<()> {
         let original_path = self.path.clone();
+        let connector = self.connector.clone();
 
-        eprintln!("Reconnecting monitor {}...", original_path.display());
+        eprintln!("Reconnecting monitor {}...", connector);
 
         match LinuxI2cTransport::probe(&original_path) {
             Ok(Some(_discovered)) => {
-                let monitor = Monitor::from_discovery(original_path.clone())?;
+                match Monitor::from_discovery(original_path.clone()) {
+                    Ok(monitor) if monitor.connector == connector => {
+                        self.path = monitor.path;
+                        self.device = monitor.device;
 
-                self.path = monitor.path;
-                self.device = monitor.device;
+                        println!(
+                            "Reconnected monitor {} on {}",
+                            connector,
+                            original_path.display()
+                        );
 
-                println!("Reconnected monitor: {}", original_path.display());
+                        return Ok(());
+                    }
 
-                return Ok(());
+                    Ok(monitor) => {
+                        eprintln!(
+                            "I2C path {} now belongs to connector {}, expected {}",
+                            original_path.display(),
+                            monitor.connector,
+                            connector
+                        );
+                    }
+
+                    Err(error) => {
+                        eprintln!(
+                            "Could not rediscover monitor on {}: {}",
+                            original_path.display(),
+                            error
+                        );
+                    }
+                }
             }
 
             Ok(None) => {
@@ -144,28 +213,75 @@ impl Monitor {
             }
         }
 
-        eprintln!("Performing full monitor discovery...");
+        eprintln!("Performing full monitor discovery for {}...", connector);
 
         let discovered = find_monitors()?;
 
         let discovered = discovered
             .into_iter()
-            .find(|monitor| monitor.path == original_path)
-            .ok_or_else(|| {
-                anyhow!("Could not rediscover monitor {}", original_path.display())
-            })?;
+            .find_map(|monitor| {
+                let path = monitor.path.clone();
+
+                match Monitor::from_discovery(path) {
+                    Ok(discovered_monitor) if discovered_monitor.connector == connector => {
+                        Some(discovered_monitor)
+                    }
+
+                    _ => None,
+                }
+            })
+            .ok_or_else(|| { anyhow!("Could not rediscover monitor {}", connector) })?;
 
         let path = discovered.path.clone();
 
-        let monitor = Monitor::from_discovery(path.clone())?;
+        let device = discovered.device;
 
-        println!("Rediscovered monitor: {}", path.display());
+        println!("Rediscovered monitor {} on {}", connector, path.display());
 
         self.path = path;
-        self.device = monitor.device;
+        self.device = device;
 
         Ok(())
     }
+}
+
+fn find_drm_connector(edid: &[u8]) -> Result<String> {
+    let drm = Path::new("/sys/class/drm");
+
+    for entry in fs::read_dir(drm)? {
+        let entry = entry?;
+        let connector_path = entry.path();
+
+        if !connector_path.is_dir() {
+            continue;
+        }
+
+        let edid_path = connector_path.join("edid");
+
+        let drm_edid = match fs::read(&edid_path) {
+            Ok(edid) => edid,
+            Err(_) => {
+                continue;
+            }
+        };
+
+        if drm_edid == edid {
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow!("DRM connector name is not valid UTF-8"))?;
+
+            let connector = name
+                .strip_prefix("card")
+                .and_then(|rest| rest.split_once('-'))
+                .map(|(_, connector)| connector)
+                .ok_or_else(|| anyhow!("Invalid DRM connector name: {}", name))?;
+
+            return Ok(connector.to_string());
+        }
+    }
+
+    Err(anyhow!("Could not resolve DRM connector from EDID"))
 }
 
 struct MonitorState {
@@ -185,20 +301,35 @@ struct MonitorState {
 }
 
 struct DisplayState {
-    monitors: Vec<MonitorHandle>,
+    monitors: HashMap<String, MonitorHandle>,
+    default_monitor: Option<String>,
 }
 
 impl DisplayState {
-    fn get(&self, index: usize) -> Result<&MonitorHandle, String> {
+    fn get(&self, connector: &str) -> Result<&MonitorHandle, String> {
         self.monitors
-            .get(index)
+            .get(connector)
             .ok_or_else(|| {
                 format!(
                     "Monitor {} does not exist ({} monitor(s) available)",
-                    index,
+                    connector,
                     self.monitors.len()
                 )
             })
+    }
+
+    fn resolve(&self, connector: Option<&str>) -> Result<&MonitorHandle, String> {
+        match connector {
+            Some(connector) => self.get(connector),
+
+            None => {
+                let connector = self.default_monitor
+                    .as_deref()
+                    .ok_or_else(|| "No default monitor is available".to_string())?;
+
+                self.get(connector)
+            }
+        }
     }
 }
 
@@ -240,7 +371,8 @@ enum MonitorCommand {
 }
 
 struct MonitorHandle {
-    index: usize,
+    connector: String,
+
     tx: mpsc::Sender<MonitorCommand>,
 }
 
@@ -250,8 +382,12 @@ impl MonitorHandle {
     }
 }
 
-fn monitor_worker(index: usize, mut state: MonitorState, mut rx: mpsc::Receiver<MonitorCommand>) {
-    println!("Monitor worker {} started for {}", index, state.monitor.path.display());
+fn monitor_worker(
+    connector: String,
+    mut state: MonitorState,
+    mut rx: mpsc::Receiver<MonitorCommand>
+) {
+    println!("Monitor worker for {} started for {}", connector, state.monitor.path.display());
 
     while let Some(command) = rx.blocking_recv() {
         match command {
@@ -289,8 +425,13 @@ fn monitor_worker(index: usize, mut state: MonitorState, mut rx: mpsc::Receiver<
 
             MonitorCommand::Info { reply } => {
                 let result = Ok(ListMonitor {
-                    index,
+                    connector: state.monitor.connector.clone(),
+
                     path: state.monitor.path.display().to_string(),
+
+                    name: state.monitor.name.clone(),
+
+                    id: state.monitor.id.clone(),
                 });
 
                 let _ = reply.send(result);
@@ -298,7 +439,7 @@ fn monitor_worker(index: usize, mut state: MonitorState, mut rx: mpsc::Receiver<
         }
     }
 
-    println!("Monitor worker {} stopped", index);
+    println!("Monitor worker for {} stopped", connector);
 }
 
 fn handle_brightness(
@@ -417,12 +558,13 @@ fn cache_path() -> Result<PathBuf> {
         return Err(anyhow!("Could not determine cache directory"));
     };
 
-    Ok(base.join("displayd").join("monitors"))
+    Ok(base.join("displayd").join("monitors.json"))
 }
 
-fn load_cached_paths() -> Vec<PathBuf> {
+fn load_cached_monitors() -> Vec<CachedMonitor> {
     let cache = match cache_path() {
         Ok(path) => path,
+
         Err(_) => {
             return Vec::new();
         }
@@ -430,33 +572,25 @@ fn load_cached_paths() -> Vec<PathBuf> {
 
     let contents = match fs::read_to_string(cache) {
         Ok(contents) => contents,
+
         Err(_) => {
             return Vec::new();
         }
     };
 
-    contents
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(PathBuf::from)
-        .collect()
+    serde_json::from_str(&contents).unwrap_or_default()
 }
 
-fn save_cached_paths(paths: &[PathBuf]) -> Result<()> {
+fn save_cached_monitors(monitors: &[CachedMonitor]) -> Result<()> {
     let cache = cache_path()?;
 
     let parent = cache.parent().ok_or_else(|| anyhow!("Invalid cache path"))?;
 
     fs::create_dir_all(parent)?;
 
-    let temporary = parent.join("monitors.tmp");
+    let temporary = parent.join("monitors.json.tmp");
 
-    let contents = paths
-        .iter()
-        .map(|path| path.to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let contents = serde_json::to_string_pretty(monitors)?;
 
     fs::write(&temporary, format!("{}\n", contents))?;
 
@@ -488,48 +622,71 @@ fn monitor_state_from_probe(
 }
 
 fn discover_monitors() -> Result<Vec<MonitorState>> {
-    let cached_paths = load_cached_paths();
+    let cached_monitors = load_cached_monitors();
 
-    if !cached_paths.is_empty() {
-        println!("Trying {} cached monitor(s)...", cached_paths.len());
+    if !cached_monitors.is_empty() {
+        println!("Trying {} cached monitor(s)...", cached_monitors.len());
 
         let mut monitors = Vec::new();
-        let mut valid_paths = Vec::new();
 
-        for path in cached_paths {
-            println!("Probing cached monitor: {}", path.display());
+        let mut valid_cache = Vec::new();
 
-            match LinuxI2cTransport::probe(&path) {
+        for cached in cached_monitors {
+            println!("Probing cached monitor {} at {}", cached.connector, cached.path.display());
+
+            match LinuxI2cTransport::probe(&cached.path) {
                 Ok(Some(discovered)) => {
-                    println!("Cached monitor is valid: {}", discovered.path.display());
+                    println!("Cached device is valid: {}", discovered.path.display());
 
                     println!("Current brightness: {}", discovered.brightness);
 
                     let path = discovered.path.clone();
 
-                    monitors.push(
-                        monitor_state_from_probe(
-                            path.clone(),
-                            discovered.brightness,
-                            discovered.brightness_maximum
-                        )?
-                    );
+                    match Monitor::from_discovery(path.clone()) {
+                        Ok(monitor) if monitor.connector == cached.connector => {
+                            drop(monitor);
 
-                    valid_paths.push(path);
+                            monitors.push(
+                                monitor_state_from_probe(
+                                    path.clone(),
+                                    discovered.brightness,
+                                    discovered.brightness_maximum
+                                )?
+                            );
+
+                            valid_cache.push(CachedMonitor {
+                                connector: cached.connector,
+                                path,
+                            });
+                        }
+
+                        Ok(monitor) => {
+                            eprintln!(
+                                "Cached path {} belongs to connector {}, expected {}",
+                                cached.path.display(),
+                                monitor.connector,
+                                cached.connector
+                            );
+                        }
+
+                        Err(error) => {
+                            eprintln!("Cached monitor {} failed: {}", cached.connector, error);
+                        }
+                    }
                 }
 
                 Ok(None) => {
-                    eprintln!("Cached device is not a DDC/CI monitor: {}", path.display());
+                    eprintln!("Cached device is not a DDC/CI monitor: {}", cached.path.display());
                 }
 
                 Err(error) => {
-                    eprintln!("Cached monitor failed: {}: {}", path.display(), error);
+                    eprintln!("Cached monitor {} failed: {}", cached.connector, error);
                 }
             }
         }
 
         if !monitors.is_empty() {
-            if let Err(error) = save_cached_paths(&valid_paths) {
+            if let Err(error) = save_cached_monitors(&valid_cache) {
                 eprintln!("Failed to update monitor cache: {}", error);
             }
 
@@ -552,27 +709,34 @@ fn discover_monitors() -> Result<Vec<MonitorState>> {
     }
 
     let mut monitors = Vec::with_capacity(discovered.len());
-    let mut paths = Vec::with_capacity(discovered.len());
 
-    for (index, discovered) in discovered.into_iter().enumerate() {
-        println!("Found monitor {}: {}", index, discovered.path.display());
+    let mut cached = Vec::with_capacity(discovered.len());
+
+    for discovered in discovered {
+        println!("Found monitor I²C at {}", discovered.path.display());
 
         println!("Current brightness: {}", discovered.brightness);
 
         let path = discovered.path.clone();
 
-        monitors.push(
-            monitor_state_from_probe(
-                path.clone(),
-                discovered.brightness,
-                discovered.brightness_maximum
-            )?
-        );
+        let state = monitor_state_from_probe(
+            path.clone(),
+            discovered.brightness,
+            discovered.brightness_maximum
+        )?;
 
-        paths.push(path);
+        println!("Found monitor {} on {}", state.monitor.connector, state.monitor.path.display());
+
+        cached.push(CachedMonitor {
+            connector: state.monitor.connector.clone(),
+
+            path,
+        });
+
+        monitors.push(state);
     }
 
-    if let Err(error) = save_cached_paths(&paths) {
+    if let Err(error) = save_cached_monitors(&cached) {
         eprintln!("Failed to update monitor cache: {}", error);
     }
 
@@ -621,9 +785,7 @@ async fn execute(request: Request, display: Arc<DisplayState>) -> Result<Message
         return list_monitors(&display).await;
     }
 
-    let index = request.monitor.unwrap_or(0);
-
-    let monitor = display.get(index).map_err(|error| anyhow!(error))?;
+    let monitor = display.resolve(request.monitor.as_deref()).map_err(|error| anyhow!(error))?;
 
     let id = request.id;
 
@@ -714,7 +876,7 @@ async fn execute(request: Request, display: Arc<DisplayState>) -> Result<Message
 async fn list_monitors(display: &DisplayState) -> Result<Message> {
     let mut monitors = Vec::with_capacity(display.monitors.len());
 
-    for monitor in &display.monitors {
+    for monitor in display.monitors.values() {
         let (reply_tx, reply_rx) = oneshot::channel();
 
         monitor
@@ -762,12 +924,14 @@ async fn handle_client(stream: UnixStream, display: Arc<DisplayState>) -> Result
 
     let request: Request = serde_json
         ::from_str(&line)
-        .map_err(|error| anyhow!("Invalid request: {}", error))?;
+        .map_err(|error| { anyhow!("Invalid request: {}", error) })?;
 
     if request.command == "subscribe" {
-        let index = request.monitor.unwrap_or(0);
+        let monitor = display.resolve(request.monitor.as_deref()).map_err(|error| anyhow!(error))?;
 
-        let monitor = display.get(index).map_err(|error| anyhow!(error))?;
+        let connector = monitor.connector.clone();
+
+        let monitor = display.get(&connector).map_err(|error| anyhow!(error))?;
 
         let (tx, mut rx) = mpsc::unbounded_channel();
 
@@ -785,13 +949,13 @@ async fn handle_client(stream: UnixStream, display: Arc<DisplayState>) -> Result
             .map_err(|_| anyhow!("Monitor worker stopped"))?
             .map_err(|error| anyhow!(error))?;
 
-        println!("New subscriber for monitor {}", index);
+        println!("New subscriber for monitor {}", connector);
 
         write_message(&mut write, &initial_response).await?;
 
         while let Some(event) = rx.recv().await {
             if let Err(error) = write_message(&mut write, &event).await {
-                eprintln!("Subscriber for monitor {} disconnected: {}", index, error);
+                eprintln!("Subscriber for monitor {} disconnected: {}", connector, error);
 
                 break;
             }
@@ -800,7 +964,7 @@ async fn handle_client(stream: UnixStream, display: Arc<DisplayState>) -> Result
         return Ok(());
     }
 
-    let monitor_text = request.monitor.map(|index| index.to_string()).unwrap_or_else(|| "0".into());
+    let monitor_text = request.monitor.as_deref().unwrap_or("<none>");
 
     println!("Executing {} on monitor {}", request.command, monitor_text);
 
@@ -850,26 +1014,35 @@ async fn main() -> Result<()> {
 
     println!("Using {} monitor(s)", monitors.len());
 
-    let mut handles = Vec::with_capacity(monitors.len());
+    let mut handles = HashMap::with_capacity(monitors.len());
+    let mut default_monitor = None;
 
-    for (index, monitor_state) in monitors.into_iter().enumerate() {
+    for monitor_state in monitors {
+        let connector = monitor_state.monitor.connector.clone();
+
+        if default_monitor.is_none() {
+            default_monitor = Some(connector.clone());
+        }
+
         let (tx, rx) = mpsc::channel::<MonitorCommand>(32);
+        let worker_connector = connector.clone();
 
         thread::Builder
             ::new()
-            .name(format!("displayd-monitor-{}", index))
+            .name(format!("displayd-monitor-{}", connector))
             .spawn(move || {
-                monitor_worker(index, monitor_state, rx);
+                monitor_worker(worker_connector, monitor_state, rx);
             })?;
 
-        handles.push(MonitorHandle {
-            index,
+        handles.insert(connector.clone(), MonitorHandle {
+            connector,
             tx,
         });
     }
 
     let display = Arc::new(DisplayState {
         monitors: handles,
+        default_monitor,
     });
 
     let listener = UnixListener::bind(&socket)?;

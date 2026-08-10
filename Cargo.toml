@@ -2,5 +2,5 @@
 resolver = "2"
 
 members = [
-    "ddcci", "displayctl", "displayd",
+    "ddcci", "displayctl", "displayd", "edid",
 ]

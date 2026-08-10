@@ -200,7 +200,7 @@ Commands:
   help        Print this message or the help of the given subcommand(s)
 
 Options:
-  -m, --monitor <MONITOR>  Monitor index (zero-based) [default: 0]
+  -m, --monitor <MONITOR>  Monitor connector (for example DP-2)
   -v, --verbose            Show detailed output
       --json               Output JSON
   -h, --help               Print help

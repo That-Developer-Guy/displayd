@@ -7,10 +7,18 @@ use serde::{ Deserialize, Serialize };
 use std::{ io::{ BufRead, BufReader, Write }, os::unix::net::UnixStream, path::PathBuf };
 
 #[derive(Debug, Deserialize, Serialize)]
+struct MonitorId {
+    manufacturer: String,
+    product: u16,
+    serial: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 struct ListMonitor {
-    index: usize,
+    connector: String,
     path: String,
-    brightness: u16,
+    name: Option<String>,
+    id: MonitorId,
 }
 
 #[derive(Parser)]
@@ -20,11 +28,10 @@ struct Cli {
     #[arg(
         short = 'm',
         long = "monitor",
-        default_value_t = 0,
         global = true,
-        help = "Monitor index (zero-based)"
+        help = "Monitor connector (for example DP-2)"
     )]
-    monitor: usize,
+    monitor: Option<String>,
 
     #[arg(short, long, help = "Show detailed output")]
     verbose: bool,
@@ -87,7 +94,7 @@ enum ValueCommand {
 struct Request {
     command: String,
 
-    monitor: Option<usize>,
+    monitor: Option<String>,
 
     value: Option<u16>,
 }
@@ -130,7 +137,7 @@ fn socket_path() -> Result<PathBuf> {
 fn handle_feature(
     command: &str,
     action: Option<ValueCommand>,
-    monitor: usize,
+    monitor: Option<String>,
     verbose: bool,
     json: bool
 ) -> Result<()> {
@@ -138,7 +145,7 @@ fn handle_feature(
         None => {
             let response = send_response(Request {
                 command: command.into(),
-                monitor: Some(monitor),
+                monitor: monitor.clone(),
                 value: None,
             })?;
 
@@ -148,7 +155,7 @@ fn handle_feature(
         Some(ValueCommand::Set { value }) => {
             let response = send_response(Request {
                 command: command.into(),
-                monitor: Some(monitor),
+                monitor: monitor.clone(),
                 value: Some(value),
             })?;
 
@@ -158,7 +165,7 @@ fn handle_feature(
         Some(ValueCommand::Up { amount }) => {
             let current = send_response(Request {
                 command: command.into(),
-                monitor: Some(monitor),
+                monitor: monitor.clone(),
                 value: None,
             })?;
 
@@ -166,7 +173,7 @@ fn handle_feature(
 
             let response = send_response(Request {
                 command: command.into(),
-                monitor: Some(monitor),
+                monitor: monitor.clone(),
                 value: Some(value),
             })?;
 
@@ -176,7 +183,7 @@ fn handle_feature(
         Some(ValueCommand::Down { amount }) => {
             let current = send_response(Request {
                 command: command.into(),
-                monitor: Some(monitor),
+                monitor: monitor.clone(),
                 value: None,
             })?;
 
@@ -184,7 +191,7 @@ fn handle_feature(
 
             let response = send_response(Request {
                 command: command.into(),
-                monitor: Some(monitor),
+                monitor: monitor,
                 value: Some(value),
             })?;
 
@@ -195,10 +202,10 @@ fn handle_feature(
     Ok(())
 }
 
-fn send_simple(command: &str, monitor: usize) -> Result<()> {
+fn send_simple(command: &str, monitor: Option<String>) -> Result<()> {
     let response = send_response(Request {
         command: command.into(),
-        monitor: Some(monitor),
+        monitor: monitor,
         value: None,
     })?;
 
@@ -261,7 +268,7 @@ fn send_response(request: Request) -> Result<Response> {
     }
 }
 
-fn watch(monitor: usize) -> Result<()> {
+fn watch(monitor: Option<String>) -> Result<()> {
     let socket = socket_path()?;
     let mut stream = UnixStream::connect(&socket)?;
 
@@ -304,10 +311,23 @@ fn list(verbose: bool, json: bool) -> Result<()> {
     }
 
     for monitor in monitors {
+        let name = monitor.name.as_deref().unwrap_or("unnamed");
+
+        let id = match monitor.id.serial {
+            Some(serial) =>
+                format!(
+                    "{}, 0x{:04x} 0x{:08x}",
+                    monitor.id.manufacturer,
+                    monitor.id.product,
+                    serial
+                ),
+            None => format!("{}, {}", monitor.id.manufacturer, monitor.id.product),
+        };
+
         if verbose {
-            println!("{}: {} (brightness: {}%)", monitor.index, monitor.path, monitor.brightness);
+            println!("{}: {} ({}) [{}]", monitor.connector, name, id, monitor.path);
         } else {
-            println!("{}: {}", monitor.index, monitor.path);
+            println!("{}: {} ({})", monitor.connector, name, id);
         }
     }
 
