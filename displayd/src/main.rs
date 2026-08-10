@@ -1,14 +1,21 @@
 use anyhow::{ anyhow, Result };
 use serde::{ Deserialize, Serialize };
 
-use std::{ collections::HashMap, fs, path::{ Path, PathBuf }, sync::Arc, thread, time::Instant };
+use std::{
+    collections::{ HashMap, HashSet },
+    fs,
+    path::{ Path, PathBuf },
+    sync::Arc,
+    thread,
+    time::{ Duration, Instant },
+};
 
 use edid::{ parse::{ parse as parse_edid, EdidData }, read::read_edid };
 
 use tokio::{
     io::{ AsyncBufReadExt, AsyncWriteExt, BufReader },
     net::{ UnixListener, UnixStream },
-    sync::{ mpsc, oneshot },
+    sync::{ mpsc, oneshot, RwLock },
 };
 
 use ddcci::{
@@ -103,6 +110,9 @@ struct CachedMonitor {
     connector: String,
 
     path: PathBuf,
+
+    #[serde(default)]
+    default: bool,
 }
 
 struct Monitor {
@@ -136,15 +146,8 @@ impl Monitor {
         })
     }
 
-    fn get_vcp_with_recovery(&mut self, feature: Feature) -> Result<VcpValue> {
-        match self.device.get_vcp(feature) {
-            Ok(value) => Ok(value),
-            Err(first_error) => {
-                eprintln!("DDC read failed on {}: {}", self.path.display(), first_error);
-                self.reconnect()?;
-                Ok(self.device.get_vcp(feature)?)
-            }
-        }
+    fn get_vcp(&mut self, feature: Feature) -> Result<VcpValue> {
+        Ok(self.device.get_vcp(feature)?)
     }
 
     fn set_vcp_with_recovery(&mut self, feature: Feature, value: u16) -> Result<()> {
@@ -275,13 +278,59 @@ fn find_drm_connector(edid: &[u8]) -> Result<String> {
                 .strip_prefix("card")
                 .and_then(|rest| rest.split_once('-'))
                 .map(|(_, connector)| connector)
-                .ok_or_else(|| anyhow!("Invalid DRM connector name: {}", name))?;
+                .ok_or_else(|| { anyhow!("Invalid DRM connector name: {}", name) })?;
 
             return Ok(connector.to_string());
         }
     }
 
     Err(anyhow!("Could not resolve DRM connector from EDID"))
+}
+
+fn connected_drm_connectors() -> Result<HashSet<String>> {
+    let drm = Path::new("/sys/class/drm");
+    let mut connected = HashSet::new();
+
+    for entry in fs::read_dir(drm)? {
+        let entry = entry?;
+        let connector_path = entry.path();
+
+        if !connector_path.is_dir() {
+            continue;
+        }
+
+        let name = match entry.file_name().into_string() {
+            Ok(name) => name,
+            Err(_) => {
+                continue;
+            }
+        };
+
+        let connector = match
+            name
+                .strip_prefix("card")
+                .and_then(|rest| rest.split_once('-'))
+                .map(|(_, connector)| connector.to_string())
+        {
+            Some(connector) => connector,
+            None => {
+                continue;
+            }
+        };
+
+        let status = match fs::read_to_string(connector_path.join("status")) {
+            Ok(status) => status,
+            Err(_) => {
+                continue;
+            }
+        };
+
+        if status.trim() == "connected" {
+            connected.insert(connector);
+        }
+    }
+
+    Ok(connected)
 }
 
 struct MonitorState {
@@ -301,33 +350,37 @@ struct MonitorState {
 }
 
 struct DisplayState {
-    monitors: HashMap<String, MonitorHandle>,
-    default_monitor: Option<String>,
+    monitors: RwLock<HashMap<String, Arc<MonitorHandle>>>,
+    default_monitor: RwLock<Option<String>>,
 }
 
 impl DisplayState {
-    fn get(&self, connector: &str) -> Result<&MonitorHandle, String> {
-        self.monitors
+    async fn get(&self, connector: &str) -> Result<Arc<MonitorHandle>, String> {
+        let monitors = self.monitors.read().await;
+
+        monitors
             .get(connector)
+            .cloned()
             .ok_or_else(|| {
                 format!(
                     "Monitor {} does not exist ({} monitor(s) available)",
                     connector,
-                    self.monitors.len()
+                    monitors.len()
                 )
             })
     }
 
-    fn resolve(&self, connector: Option<&str>) -> Result<&MonitorHandle, String> {
+    async fn resolve(&self, connector: Option<&str>) -> Result<Arc<MonitorHandle>, String> {
         match connector {
-            Some(connector) => self.get(connector),
+            Some(connector) => self.get(connector).await,
 
             None => {
                 let connector = self.default_monitor
-                    .as_deref()
-                    .ok_or_else(|| "No default monitor is available".to_string())?;
+                    .read().await
+                    .clone()
+                    .ok_or_else(|| { "No default monitor is available".to_string() })?;
 
-                self.get(connector)
+                self.get(&connector).await
             }
         }
     }
@@ -600,13 +653,11 @@ fn save_cached_monitors(monitors: &[CachedMonitor]) -> Result<()> {
 }
 
 fn monitor_state_from_probe(
-    path: PathBuf,
+    mut monitor: Monitor,
     brightness: u16,
     brightness_maximum: u16
 ) -> Result<MonitorState> {
-    let mut monitor = Monitor::from_discovery(path)?;
-
-    let contrast = monitor.get_vcp_with_recovery(Feature::Contrast)?;
+    let contrast = monitor.get_vcp(Feature::Contrast)?;
 
     println!("Current contrast: {}/{}", contrast.current, contrast.maximum);
 
@@ -621,126 +672,407 @@ fn monitor_state_from_probe(
     })
 }
 
-fn discover_monitors() -> Result<Vec<MonitorState>> {
+fn discover_monitors() -> Result<(Vec<MonitorState>, Option<String>)> {
     let cached_monitors = load_cached_monitors();
 
-    if !cached_monitors.is_empty() {
-        println!("Trying {} cached monitor(s)...", cached_monitors.len());
+    let cached_default = cached_monitors
+        .iter()
+        .find(|monitor| monitor.default)
+        .map(|monitor| monitor.connector.clone());
 
-        let mut monitors = Vec::new();
+    let mut monitors_by_connector = HashMap::<String, MonitorState>::new();
 
-        let mut valid_cache = Vec::new();
+    for cached in &cached_monitors {
+        println!("Probing cached monitor {} at {}", cached.connector, cached.path.display());
 
-        for cached in cached_monitors {
-            println!("Probing cached monitor {} at {}", cached.connector, cached.path.display());
+        match LinuxI2cTransport::probe(&cached.path) {
+            Ok(Some(discovered)) => {
+                let path = discovered.path.clone();
 
-            match LinuxI2cTransport::probe(&cached.path) {
-                Ok(Some(discovered)) => {
-                    println!("Cached device is valid: {}", discovered.path.display());
+                match Monitor::from_discovery(path.clone()) {
+                    Ok(monitor) if monitor.connector == cached.connector => {
+                        match
+                            monitor_state_from_probe(
+                                monitor,
+                                discovered.brightness,
+                                discovered.brightness_maximum
+                            )
+                        {
+                            Ok(state) => {
+                                println!(
+                                    "Restored monitor {} on {}",
+                                    state.monitor.connector,
+                                    state.monitor.path.display()
+                                );
 
-                    println!("Current brightness: {}", discovered.brightness);
+                                monitors_by_connector.insert(
+                                    state.monitor.connector.clone(),
+                                    state
+                                );
+                            }
 
-                    let path = discovered.path.clone();
-
-                    match Monitor::from_discovery(path.clone()) {
-                        Ok(monitor) if monitor.connector == cached.connector => {
-                            drop(monitor);
-
-                            monitors.push(
-                                monitor_state_from_probe(
-                                    path.clone(),
-                                    discovered.brightness,
-                                    discovered.brightness_maximum
-                                )?
-                            );
-
-                            valid_cache.push(CachedMonitor {
-                                connector: cached.connector,
-                                path,
-                            });
-                        }
-
-                        Ok(monitor) => {
-                            eprintln!(
-                                "Cached path {} belongs to connector {}, expected {}",
-                                cached.path.display(),
-                                monitor.connector,
-                                cached.connector
-                            );
-                        }
-
-                        Err(error) => {
-                            eprintln!("Cached monitor {} failed: {}", cached.connector, error);
+                            Err(error) => {
+                                eprintln!("Cached monitor {} failed: {}", cached.connector, error);
+                            }
                         }
                     }
-                }
 
-                Ok(None) => {
-                    eprintln!("Cached device is not a DDC/CI monitor: {}", cached.path.display());
-                }
+                    Ok(monitor) => {
+                        eprintln!(
+                            "Cached path {} belongs to connector {}, expected {}",
+                            cached.path.display(),
+                            monitor.connector,
+                            cached.connector
+                        );
+                    }
 
-                Err(error) => {
-                    eprintln!("Cached monitor {} failed: {}", cached.connector, error);
+                    Err(error) => {
+                        eprintln!("Cached monitor {} failed: {}", cached.connector, error);
+                    }
                 }
             }
-        }
 
-        if !monitors.is_empty() {
-            if let Err(error) = save_cached_monitors(&valid_cache) {
-                eprintln!("Failed to update monitor cache: {}", error);
+            Ok(None) => {
+                eprintln!("Cached device is not a DDC/CI monitor: {}", cached.path.display());
             }
 
-            return Ok(monitors);
+            Err(error) => {
+                eprintln!("Cached monitor {} failed: {}", cached.connector, error);
+            }
         }
-
-        eprintln!(
-            "No cached monitors could be opened; \
-             performing full monitor discovery..."
-        );
-    } else {
-        println!("No cached monitors found; \
-             performing full monitor discovery...");
     }
 
-    let discovered = find_monitors()?;
+    println!("Performing full monitor discovery...");
 
-    if discovered.is_empty() {
+    let discovered = match find_monitors() {
+        Ok(monitors) => monitors,
+
+        Err(error) => {
+            eprintln!("Full monitor discovery failed: {}", error);
+
+            let mut monitors = monitors_by_connector.into_values().collect::<Vec<_>>();
+
+            monitors.sort_by(|a, b| { a.monitor.connector.cmp(&b.monitor.connector) });
+
+            if monitors.is_empty() {
+                return Err(error.into());
+            }
+
+            let default_monitor = cached_default
+                .filter(|connector| {
+                    monitors.iter().any(|monitor| monitor.monitor.connector == *connector)
+                })
+                .or_else(|| { monitors.first().map(|monitor| monitor.monitor.connector.clone()) });
+
+            return Ok((monitors, default_monitor));
+        }
+    };
+
+    for discovered in discovered {
+        let path = discovered.path.clone();
+
+        let monitor = match Monitor::from_discovery(path.clone()) {
+            Ok(monitor) => monitor,
+
+            Err(error) => {
+                eprintln!("Failed to inspect discovered monitor at {}: {}", path.display(), error);
+
+                continue;
+            }
+        };
+
+        if monitors_by_connector.contains_key(&monitor.connector) {
+            continue;
+        }
+
+        let connector = monitor.connector.clone();
+
+        println!("Found new monitor I²C at {}", path.display());
+        println!("Current brightness: {}", discovered.brightness);
+
+        match
+            monitor_state_from_probe(monitor, discovered.brightness, discovered.brightness_maximum)
+        {
+            Ok(state) => {
+                println!(
+                    "Found monitor {} on {}",
+                    state.monitor.connector,
+                    state.monitor.path.display()
+                );
+
+                monitors_by_connector.insert(connector, state);
+            }
+
+            Err(error) => {
+                eprintln!("Failed to probe monitor {}: {}", connector, error);
+
+                continue;
+            }
+        }
+    }
+
+    if monitors_by_connector.is_empty() {
         return Err(anyhow!("No DDC/CI monitors found"));
     }
 
-    let mut monitors = Vec::with_capacity(discovered.len());
+    let mut monitors = monitors_by_connector.into_values().collect::<Vec<_>>();
 
-    let mut cached = Vec::with_capacity(discovered.len());
+    monitors.sort_by(|a, b| { a.monitor.connector.cmp(&b.monitor.connector) });
 
-    for discovered in discovered {
-        println!("Found monitor I²C at {}", discovered.path.display());
+    let default_monitor = cached_default
+        .filter(|connector| {
+            monitors.iter().any(|monitor| monitor.monitor.connector == *connector)
+        })
+        .or_else(|| { monitors.first().map(|monitor| monitor.monitor.connector.clone()) });
 
-        println!("Current brightness: {}", discovered.brightness);
+    save_monitor_cache(&monitors, default_monitor.as_deref())?;
 
-        let path = discovered.path.clone();
+    Ok((monitors, default_monitor))
+}
 
-        let state = monitor_state_from_probe(
-            path.clone(),
-            discovered.brightness,
-            discovered.brightness_maximum
-        )?;
+fn save_monitor_cache(monitors: &[MonitorState], default_monitor: Option<&str>) -> Result<()> {
+    let cached = monitors
+        .iter()
+        .map(|state| CachedMonitor {
+            connector: state.monitor.connector.clone(),
+            path: state.monitor.path.clone(),
+            default: Some(state.monitor.connector.as_str()) == default_monitor,
+        })
+        .collect::<Vec<_>>();
 
-        println!("Found monitor {} on {}", state.monitor.connector, state.monitor.path.display());
+    save_cached_monitors(&cached)
+}
+
+async fn save_display_cache(display: &DisplayState) -> Result<()> {
+    let default_monitor = display.default_monitor.read().await.clone();
+
+    let handles = {
+        let monitors = display.monitors.read().await;
+
+        monitors.values().cloned().collect::<Vec<_>>()
+    };
+
+    let mut cached = Vec::with_capacity(handles.len());
+
+    for handle in handles {
+        let (reply_tx, reply_rx) = oneshot::channel();
+
+        handle
+            .send(MonitorCommand::Info { reply: reply_tx }).await
+            .map_err(|error| anyhow!(error))?;
+
+        let info = reply_rx.await
+            .map_err(|_| anyhow!("Monitor worker stopped"))?
+            .map_err(|error| anyhow!(error))?;
 
         cached.push(CachedMonitor {
-            connector: state.monitor.connector.clone(),
-
-            path,
+            connector: info.connector.clone(),
+            path: PathBuf::from(info.path),
+            default: Some(info.connector.as_str()) == default_monitor.as_deref(),
         });
-
-        monitors.push(state);
     }
 
-    if let Err(error) = save_cached_monitors(&cached) {
-        eprintln!("Failed to update monitor cache: {}", error);
-    }
+    save_cached_monitors(&cached)
+}
 
-    Ok(monitors)
+async fn hotplug_monitor(display: Arc<DisplayState>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+
+    loop {
+        interval.tick().await;
+
+        let connected = match tokio::task::spawn_blocking(connected_drm_connectors).await {
+            Ok(Ok(connectors)) => connectors,
+
+            Ok(Err(error)) => {
+                eprintln!("DRM connector status check failed: {}", error);
+                continue;
+            }
+
+            Err(error) => {
+                eprintln!("DRM connector status task failed: {}", error);
+                continue;
+            }
+        };
+
+        let removed_connectors = {
+            let mut monitors = display.monitors.write().await;
+
+            let existing = monitors.keys().cloned().collect::<Vec<_>>();
+            let mut removed = Vec::new();
+
+            for connector in existing {
+                if !connected.contains(&connector) {
+                    if monitors.remove(&connector).is_some() {
+                        removed.push(connector);
+                    }
+                }
+            }
+
+            removed
+        };
+
+        for connector in &removed_connectors {
+            println!("Monitor unplugged: {}", connector);
+
+            let default_changed = {
+                let mut default = display.default_monitor.write().await;
+
+                if default.as_deref() == Some(connector.as_str()) {
+                    let replacement = {
+                        let monitors = display.monitors.read().await;
+                        monitors.keys().next().cloned()
+                    };
+
+                    *default = replacement;
+                    true
+                } else {
+                    false
+                }
+            };
+
+            if default_changed {
+                let default = display.default_monitor.read().await.clone();
+
+                println!("Default monitor changed to {}", default.as_deref().unwrap_or("<none>"));
+            }
+        }
+
+        let existing = {
+            let monitors = display.monitors.read().await;
+            monitors.keys().cloned().collect::<HashSet<_>>()
+        };
+
+        let needs_discovery = connected.iter().any(|connector| !existing.contains(connector));
+
+        if !needs_discovery {
+            if !removed_connectors.is_empty() {
+                if let Err(error) = save_display_cache(&display).await {
+                    eprintln!("Failed to update monitor cache after removal: {}", error);
+                }
+            }
+
+            continue;
+        }
+
+        let discovered = match tokio::task::spawn_blocking(find_monitors).await {
+            Ok(Ok(monitors)) => monitors,
+
+            Ok(Err(error)) => {
+                eprintln!("Monitor hotplug discovery failed: {}", error);
+                continue;
+            }
+
+            Err(error) => {
+                eprintln!("Monitor discovery task failed: {}", error);
+                continue;
+            }
+        };
+
+        for discovered in discovered {
+            let path = discovered.path.clone();
+
+            let monitor = match Monitor::from_discovery(path.clone()) {
+                Ok(monitor) => monitor,
+
+                Err(error) => {
+                    eprintln!(
+                        "Failed to inspect discovered monitor at {}: {}",
+                        path.display(),
+                        error
+                    );
+
+                    continue;
+                }
+            };
+
+            let connector = monitor.connector.clone();
+
+            if !connected.contains(&connector) {
+                continue;
+            }
+
+            let already_present = {
+                let monitors = display.monitors.read().await;
+                monitors.contains_key(&connector)
+            };
+
+            if already_present {
+                continue;
+            }
+
+            println!(
+                "Hotplug detected: {} ({})",
+                connector,
+                monitor.name.as_deref().unwrap_or("unnamed")
+            );
+
+            let state = match
+                monitor_state_from_probe(
+                    monitor,
+                    discovered.brightness,
+                    discovered.brightness_maximum
+                )
+            {
+                Ok(state) => state,
+
+                Err(error) => {
+                    eprintln!("Failed to probe newly connected monitor {}: {}", connector, error);
+
+                    continue;
+                }
+            };
+
+            let handle = match start_monitor_worker(state) {
+                Ok(handle) => handle,
+
+                Err(error) => {
+                    eprintln!("Failed to start worker for new monitor {}: {}", connector, error);
+
+                    continue;
+                }
+            };
+
+            let inserted = {
+                let mut monitors = display.monitors.write().await;
+
+                if monitors.contains_key(&connector) {
+                    false
+                } else {
+                    monitors.insert(connector.clone(), handle);
+                    true
+                }
+            };
+
+            if inserted {
+                println!("Added hotplugged monitor {}", connector);
+            }
+        }
+
+        let default_missing = {
+            let default = display.default_monitor.read().await;
+            default.is_none()
+        };
+
+        if default_missing {
+            let replacement = {
+                let monitors = display.monitors.read().await;
+                monitors.keys().next().cloned()
+            };
+
+            if let Some(replacement) = replacement {
+                *display.default_monitor.write().await = Some(replacement.clone());
+
+                println!("Selected {} as the default monitor", replacement);
+            }
+        }
+
+        if !removed_connectors.is_empty() || needs_discovery {
+            if let Err(error) = save_display_cache(&display).await {
+                eprintln!("Failed to update monitor cache after hotplug: {}", error);
+            }
+        }
+    }
 }
 
 fn effective_brightness(state: &MonitorState) -> u16 {
@@ -785,7 +1117,9 @@ async fn execute(request: Request, display: Arc<DisplayState>) -> Result<Message
         return list_monitors(&display).await;
     }
 
-    let monitor = display.resolve(request.monitor.as_deref()).map_err(|error| anyhow!(error))?;
+    let monitor = display
+        .resolve(request.monitor.as_deref()).await
+        .map_err(|error| anyhow!(error))?;
 
     let id = request.id;
 
@@ -874,25 +1208,31 @@ async fn execute(request: Request, display: Arc<DisplayState>) -> Result<Message
 }
 
 async fn list_monitors(display: &DisplayState) -> Result<Message> {
-    let mut monitors = Vec::with_capacity(display.monitors.len());
+    let monitors = {
+        let handles = display.monitors.read().await;
 
-    for monitor in display.monitors.values() {
+        handles.values().cloned().collect::<Vec<_>>()
+    };
+
+    let mut result = Vec::with_capacity(monitors.len());
+
+    for monitor in monitors {
         let (reply_tx, reply_rx) = oneshot::channel();
 
         monitor
-            .send(MonitorCommand::Info {
-                reply: reply_tx,
-            }).await
+            .send(MonitorCommand::Info { reply: reply_tx }).await
             .map_err(|error| anyhow!(error))?;
 
         let info = reply_rx.await
             .map_err(|_| anyhow!("Monitor worker stopped"))?
             .map_err(|error| anyhow!(error))?;
 
-        monitors.push(info);
+        result.push(info);
     }
 
-    Ok(Message::List { monitors })
+    result.sort_by(|a, b| a.connector.cmp(&b.connector));
+
+    Ok(Message::List { monitors: result })
 }
 
 async fn write_message(
@@ -911,7 +1251,6 @@ async fn handle_client(stream: UnixStream, display: Arc<DisplayState>) -> Result
     let (read, mut write) = stream.into_split();
 
     let mut reader = BufReader::new(read);
-
     let mut line = String::new();
 
     let bytes = reader.read_line(&mut line).await?;
@@ -924,14 +1263,14 @@ async fn handle_client(stream: UnixStream, display: Arc<DisplayState>) -> Result
 
     let request: Request = serde_json
         ::from_str(&line)
-        .map_err(|error| { anyhow!("Invalid request: {}", error) })?;
+        .map_err(|error| anyhow!("Invalid request: {}", error))?;
 
     if request.command == "subscribe" {
-        let monitor = display.resolve(request.monitor.as_deref()).map_err(|error| anyhow!(error))?;
+        let monitor = display
+            .resolve(request.monitor.as_deref()).await
+            .map_err(|error| anyhow!(error))?;
 
         let connector = monitor.connector.clone();
-
-        let monitor = display.get(&connector).map_err(|error| anyhow!(error))?;
 
         let (tx, mut rx) = mpsc::unbounded_channel();
 
@@ -969,7 +1308,6 @@ async fn handle_client(stream: UnixStream, display: Arc<DisplayState>) -> Result
     println!("Executing {} on monitor {}", request.command, monitor_text);
 
     let start = Instant::now();
-
     let request_id = request.id;
 
     match execute(request, display).await {
@@ -1002,6 +1340,28 @@ fn socket_path() -> Result<PathBuf> {
     Ok(PathBuf::from(runtime).join("displayd.sock"))
 }
 
+fn start_monitor_worker(monitor_state: MonitorState) -> Result<Arc<MonitorHandle>> {
+    let connector = monitor_state.monitor.connector.clone();
+
+    let (tx, rx) = mpsc::channel::<MonitorCommand>(32);
+
+    let worker_connector = connector.clone();
+
+    thread::Builder
+        ::new()
+        .name(format!("displayd-monitor-{}", connector))
+        .spawn(move || {
+            monitor_worker(worker_connector, monitor_state, rx);
+        })?;
+
+    Ok(
+        Arc::new(MonitorHandle {
+            connector,
+            tx,
+        })
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let socket = socket_path()?;
@@ -1010,39 +1370,27 @@ async fn main() -> Result<()> {
         fs::remove_file(&socket)?;
     }
 
-    let monitors = tokio::task::spawn_blocking(discover_monitors).await??;
+    let (monitors, default_monitor) = tokio::task::spawn_blocking(discover_monitors).await??;
 
     println!("Using {} monitor(s)", monitors.len());
 
     let mut handles = HashMap::with_capacity(monitors.len());
-    let mut default_monitor = None;
 
     for monitor_state in monitors {
-        let connector = monitor_state.monitor.connector.clone();
+        let handle = start_monitor_worker(monitor_state)?;
 
-        if default_monitor.is_none() {
-            default_monitor = Some(connector.clone());
-        }
-
-        let (tx, rx) = mpsc::channel::<MonitorCommand>(32);
-        let worker_connector = connector.clone();
-
-        thread::Builder
-            ::new()
-            .name(format!("displayd-monitor-{}", connector))
-            .spawn(move || {
-                monitor_worker(worker_connector, monitor_state, rx);
-            })?;
-
-        handles.insert(connector.clone(), MonitorHandle {
-            connector,
-            tx,
-        });
+        handles.insert(handle.connector.clone(), handle);
     }
 
     let display = Arc::new(DisplayState {
-        monitors: handles,
-        default_monitor,
+        monitors: RwLock::new(handles),
+        default_monitor: RwLock::new(default_monitor),
+    });
+
+    let hotplug_display = Arc::clone(&display);
+
+    tokio::spawn(async move {
+        hotplug_monitor(hotplug_display).await;
     });
 
     let listener = UnixListener::bind(&socket)?;
