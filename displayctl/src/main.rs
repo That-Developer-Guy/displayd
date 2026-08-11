@@ -68,6 +68,9 @@ enum Command {
 
     /// List available monitors
     List,
+
+    // Info about a specified monitor
+    Info,
 }
 
 #[derive(Subcommand)]
@@ -119,6 +122,10 @@ enum Message {
 
     #[serde(rename = "list")] List {
         monitors: Vec<ListMonitor>,
+    },
+
+    #[serde(rename = "info")] Info {
+        monitor: ListMonitor,
     },
 
     #[serde(rename = "error")] Error {
@@ -230,6 +237,22 @@ fn send_list() -> Result<Vec<ListMonitor>> {
     }
 }
 
+fn send_info() -> Result<ListMonitor> {
+    match
+        send(Request {
+            command: "info".into(),
+            monitor: None,
+            value: None,
+        })?
+    {
+        Message::Info { monitor } => Ok(monitor),
+
+        Message::Error { error } => { Err(anyhow!("{}", error)) }
+
+        other => { Err(anyhow!("Unexpected response from daemon: {:?}", other)) }
+    }
+}
+
 fn send(request: Request) -> Result<Message> {
     let socket = socket_path()?;
     let mut stream = UnixStream::connect(&socket)?;
@@ -334,6 +357,30 @@ fn list(verbose: bool, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn info(json: bool) -> Result<()> {
+    let monitor = send_info()?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&monitor)?);
+        return Ok(());
+    }
+
+    println!("Monitor information:");
+    println!("\tConnector: {}", monitor.connector);
+    println!("\tName: {}", monitor.name.as_deref().unwrap_or("Unknown"));
+    println!("\tManufacturer: {}", monitor.id.manufacturer);
+    println!("\tProduct code: 0x{:04x}", monitor.id.product);
+
+    match monitor.id.serial {
+        Some(serial) => println!("\tSerial number: 0x{:08x}", serial),
+        None => println!("\tSerial number: Unknown"),
+    }
+
+    println!("\tI²C path: {}", monitor.path);
+
+    Ok(())
+}
+
 fn print_value(value: Response, verbose: bool, json: bool) {
     if json {
         println!("{}", serde_json::to_string(&value).unwrap());
@@ -374,6 +421,10 @@ fn main() -> Result<()> {
 
         Command::List => {
             list(cli.verbose, cli.json)?;
+        }
+
+        Command::Info => {
+            info(cli.json)?;
         }
     }
 

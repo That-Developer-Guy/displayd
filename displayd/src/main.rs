@@ -80,6 +80,10 @@ enum Message {
         monitors: Vec<ListMonitor>,
     },
 
+    #[serde(rename = "info")] Info {
+        monitor: ListMonitor,
+    },
+
     #[serde(rename = "error")] Error {
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<u64>,
@@ -1120,6 +1124,20 @@ async fn execute(request: Request, display: Arc<DisplayState>) -> Result<Message
     let monitor = display
         .resolve(request.monitor.as_deref()).await
         .map_err(|error| anyhow!(error))?;
+
+    if request.command == "info" {
+        let (reply_tx, reply_rx) = oneshot::channel();
+
+        monitor
+            .send(MonitorCommand::Info { reply: reply_tx }).await
+            .map_err(|error| anyhow!(error))?;
+
+        let info = reply_rx.await
+            .map_err(|_| anyhow!("Monitor worker stopped"))?
+            .map_err(|error| anyhow!(error))?;
+
+        return Ok(Message::Info { monitor: info });
+    }
 
     let id = request.id;
 
