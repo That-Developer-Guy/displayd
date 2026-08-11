@@ -197,6 +197,7 @@ Commands:
   undim       Reset dim (10% of brightness level)
   watch       Listen for display changes
   list        List available monitors
+  info        Request information about a monitor
   help        Print this message or the help of the given subcommand(s)
 
 Options:

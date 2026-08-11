@@ -69,7 +69,7 @@ enum Command {
     /// List available monitors
     List,
 
-    // Info about a specified monitor
+    /// Request information about a monitor
     Info,
 }
 
