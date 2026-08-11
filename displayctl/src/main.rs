@@ -237,11 +237,11 @@ fn send_list() -> Result<Vec<ListMonitor>> {
     }
 }
 
-fn send_info() -> Result<ListMonitor> {
+fn send_info(monitor: Option<String>) -> Result<ListMonitor> {
     match
         send(Request {
             command: "info".into(),
-            monitor: None,
+            monitor: monitor,
             value: None,
         })?
     {
@@ -357,8 +357,8 @@ fn list(verbose: bool, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn info(json: bool) -> Result<()> {
-    let monitor = send_info()?;
+fn info(monitor: Option<String>, json: bool) -> Result<()> {
+    let monitor = send_info(monitor)?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&monitor)?);
@@ -424,7 +424,7 @@ fn main() -> Result<()> {
         }
 
         Command::Info => {
-            info(cli.json)?;
+            info(cli.monitor, cli.json)?;
         }
     }
 
