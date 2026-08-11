@@ -1,5 +1,6 @@
 use crate::error::Error;
 
+#[derive(Debug, Clone)]
 pub enum ProductionDate {
     Manufacture {
         week: u8,
@@ -10,12 +11,14 @@ pub enum ProductionDate {
     },
 }
 
+#[derive(Debug, Clone)]
 pub struct EdidData {
     pub id: String,
     pub name: Option<String>,
     pub product_code: u16,
     pub serial_number: u32,
     pub production_date: ProductionDate,
+    pub edid_version: String,
 }
 
 pub fn parse(edid: &[u8]) -> Result<EdidData, Error> {
@@ -53,12 +56,18 @@ pub fn parse(edid: &[u8]) -> Result<EdidData, Error> {
 
     let name = parse_name(edid);
 
+    let major_version = edid[18];
+    let minor_version = edid[19];
+
+    let edid_version = format!("{}.{}", major_version, minor_version);
+
     Ok(EdidData {
         id,
         name,
         product_code,
         serial_number,
         production_date,
+        edid_version,
     })
 }
 

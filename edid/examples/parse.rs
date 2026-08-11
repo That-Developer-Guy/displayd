@@ -22,6 +22,7 @@ fn main() {
                                 println!("Production date: Model year {}", year);
                             }
                         }
+                        println!("EDID Version: {}", edid_data.edid_version);
                     }
                     Err(e) => { println!("Parsing failed: {}", e) }
                 }

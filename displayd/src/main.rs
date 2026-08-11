@@ -10,7 +10,7 @@ use std::{
     time::{ Duration, Instant },
 };
 
-use edid::{ parse::{ parse as parse_edid, EdidData }, read::read_edid };
+use edid::{ parse::{ parse as parse_edid, EdidData, ProductionDate }, read::read_edid };
 
 use tokio::{
     io::{ AsyncBufReadExt, AsyncWriteExt, BufReader },
@@ -44,12 +44,59 @@ struct Request {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
+enum ProductionDateInfo {
+    Manufacture {
+        week: u8,
+        year: u16,
+    },
+    ModelYear {
+        year: u16,
+    },
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct MonitorEdidInfo {
+    manufacturer: String,
+    name: Option<String>,
+    product_code: u16,
+    edid_version: String,
+    serial_number: u32,
+    production_date: ProductionDateInfo,
+}
+
+impl From<&EdidData> for MonitorEdidInfo {
+    fn from(edid: &EdidData) -> Self {
+        Self {
+            manufacturer: edid.id.clone(),
+            name: edid.name.clone(),
+            product_code: edid.product_code,
+            serial_number: edid.serial_number,
+            edid_version: edid.edid_version.clone(),
+            production_date: match &edid.production_date {
+                ProductionDate::Manufacture { week, year } =>
+                    ProductionDateInfo::Manufacture {
+                        week: *week,
+                        year: *year,
+                    },
+
+                ProductionDate::ModelYear { year } =>
+                    ProductionDateInfo::ModelYear {
+                        year: *year,
+                    },
+            },
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct ListMonitor {
     connector: String,
 
     path: String,
 
     name: Option<String>,
+
+    edid_data: MonitorEdidInfo,
 
     id: MonitorId,
 }
@@ -126,6 +173,8 @@ struct Monitor {
 
     name: Option<String>,
 
+    edid_data: EdidData,
+
     path: PathBuf,
     device: Ddc,
 }
@@ -138,13 +187,16 @@ impl Monitor {
         let edid_bytes = read_edid(&path)?;
         let edid = parse_edid(&edid_bytes)?;
 
+        println!("{}", edid.edid_version);
+
         let id = MonitorId::from_edid(&edid)?;
-        let connector = find_drm_connector(&edid_bytes);
+        let connector = find_drm_connector(&edid_bytes)?;
 
         Ok(Self {
             id,
-            connector: connector?,
-            name: edid.name,
+            connector,
+            name: edid.name.clone(),
+            edid_data: edid,
             path,
             device,
         })
@@ -487,6 +539,8 @@ fn monitor_worker(
                     path: state.monitor.path.display().to_string(),
 
                     name: state.monitor.name.clone(),
+
+                    edid_data: (&state.monitor.edid_data).into(),
 
                     id: state.monitor.id.clone(),
                 });

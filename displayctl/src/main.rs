@@ -13,11 +13,33 @@ struct MonitorId {
     serial: Option<u32>,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone)]
+enum ProductionDateInfo {
+    Manufacture {
+        week: u8,
+        year: u16,
+    },
+    ModelYear {
+        year: u16,
+    },
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct MonitorEdidInfo {
+    manufacturer: String,
+    name: Option<String>,
+    product_code: u16,
+    serial_number: u32,
+    production_date: ProductionDateInfo,
+    edid_version: String,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct ListMonitor {
     connector: String,
     path: String,
     name: Option<String>,
+    edid_data: MonitorEdidInfo,
     id: MonitorId,
 }
 
@@ -339,7 +361,7 @@ fn list(verbose: bool, json: bool) -> Result<()> {
         let id = match monitor.id.serial {
             Some(serial) =>
                 format!(
-                    "{}, 0x{:04x} 0x{:08x}",
+                    "{}, 0x{:04x}, 0x{:08x}",
                     monitor.id.manufacturer,
                     monitor.id.product,
                     serial
@@ -348,7 +370,14 @@ fn list(verbose: bool, json: bool) -> Result<()> {
         };
 
         if verbose {
-            println!("{}: {} ({}) [{}]", monitor.connector, name, id, monitor.path);
+            println!(
+                "{}: {} ({}, EDID {}) [{}]",
+                monitor.connector,
+                name,
+                id,
+                monitor.edid_data.edid_version,
+                monitor.path
+            );
         } else {
             println!("{}: {} ({})", monitor.connector, name, id);
         }
@@ -369,12 +398,22 @@ fn info(monitor: Option<String>, json: bool) -> Result<()> {
     println!("\tConnector: {}", monitor.connector);
     println!("\tName: {}", monitor.name.as_deref().unwrap_or("Unknown"));
     println!("\tManufacturer: {}", monitor.id.manufacturer);
-    println!("\tProduct code: 0x{:04x}", monitor.id.product);
+    println!("\tProduct code: 0x{:04x} ({})", monitor.id.product, monitor.id.product);
 
     match monitor.id.serial {
-        Some(serial) => println!("\tSerial number: 0x{:08x}", serial),
+        Some(serial) => println!("\tSerial number: 0x{:08x} ({})", serial, serial),
         None => println!("\tSerial number: Unknown"),
     }
+
+    match monitor.edid_data.production_date {
+        ProductionDateInfo::Manufacture { week, year } => {
+            println!("\tProduction date: Week {}, {}", week, year);
+        }
+        ProductionDateInfo::ModelYear { year } => {
+            println!("\tModel year: {}", year);
+        }
+    }
+    println!("\tEDID version: {}", monitor.edid_data.edid_version);
 
     println!("\tI²C path: {}", monitor.path);
 
