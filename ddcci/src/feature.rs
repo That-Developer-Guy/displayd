@@ -6,6 +6,7 @@ pub enum Feature {
     Volume,
     Mute,
     PowerMode,
+    VcpVersion,
 
     Raw(u8),
 }
@@ -19,6 +20,7 @@ impl From<Feature> for u8 {
             Feature::Volume => 0x62,
             Feature::Mute => 0x8d,
             Feature::PowerMode => 0xd6,
+            Feature::VcpVersion => 0xdf,
             Feature::Raw(code) => code,
         }
     }
@@ -33,6 +35,7 @@ impl From<u8> for Feature {
             0x62 => Feature::Volume,
             0x8d => Feature::Mute,
             0xd6 => Feature::PowerMode,
+            0xdf => Feature::VcpVersion,
             other => Feature::Raw(other),
         }
     }

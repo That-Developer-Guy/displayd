@@ -28,5 +28,9 @@ fn main() -> anyhow::Result<()> {
         brightness.percentage()
     );
 
+    let version = device.get_mccs_version()?;
+
+    println!("MCCS {}", version);
+
     Ok(())
 }

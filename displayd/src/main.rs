@@ -98,6 +98,8 @@ struct ListMonitor {
 
     edid_data: MonitorEdidInfo,
 
+    mccs_version: Option<String>,
+
     id: MonitorId,
 }
 
@@ -175,6 +177,8 @@ struct Monitor {
 
     edid_data: EdidData,
 
+    mccs_version: Option<String>,
+
     path: PathBuf,
     device: Ddc,
 }
@@ -182,12 +186,15 @@ struct Monitor {
 impl Monitor {
     fn from_discovery(path: PathBuf) -> Result<Self> {
         let transport = LinuxI2cTransport::open(path.clone())?;
-        let device = DdcDevice::new(transport);
+        let mut device = DdcDevice::new(transport);
+
+        let mccs_version = device
+            .get_mccs_version()
+            .ok()
+            .map(|version| version.to_string());
 
         let edid_bytes = read_edid(&path)?;
         let edid = parse_edid(&edid_bytes)?;
-
-        println!("{}", edid.edid_version);
 
         let id = MonitorId::from_edid(&edid)?;
         let connector = find_drm_connector(&edid_bytes)?;
@@ -197,6 +204,7 @@ impl Monitor {
             connector,
             name: edid.name.clone(),
             edid_data: edid,
+            mccs_version,
             path,
             device,
         })
@@ -541,6 +549,8 @@ fn monitor_worker(
                     name: state.monitor.name.clone(),
 
                     edid_data: (&state.monitor.edid_data).into(),
+
+                    mccs_version: state.monitor.mccs_version.clone(),
 
                     id: state.monitor.id.clone(),
                 });

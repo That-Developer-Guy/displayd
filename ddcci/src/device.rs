@@ -7,6 +7,27 @@ use crate::{
     Result,
 };
 
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct MccsVersion {
+    pub major: u8,
+    pub minor: u8,
+}
+
+impl MccsVersion {
+    pub fn from_vcp_value(value: u16) -> Self {
+        Self {
+            major: (value >> 8) as u8,
+            minor: value as u8,
+        }
+    }
+}
+
+impl std::fmt::Display for MccsVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.major, self.minor)
+    }
+}
+
 pub struct DdcDevice<T: Transport> {
     transport: T,
 }
@@ -62,5 +83,11 @@ impl<T: Transport> DdcDevice<T> {
         }
 
         self.set_vcp(feature, value)
+    }
+
+    pub fn get_mccs_version(&mut self) -> Result<MccsVersion> {
+        let value = self.get_vcp(Feature::VcpVersion)?;
+
+        Ok(MccsVersion::from_vcp_value(value.current))
     }
 }

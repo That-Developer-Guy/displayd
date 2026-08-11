@@ -40,6 +40,7 @@ struct ListMonitor {
     path: String,
     name: Option<String>,
     edid_data: MonitorEdidInfo,
+    mccs_version: Option<String>,
     id: MonitorId,
 }
 
@@ -414,6 +415,10 @@ fn info(monitor: Option<String>, json: bool) -> Result<()> {
         }
     }
     println!("\tEDID version: {}", monitor.edid_data.edid_version);
+    match &monitor.mccs_version {
+        Some(version) => println!("\tMCCS (VCP) version: {version}"),
+        None => println!("\tMCCS (VCP) version: unknown"),
+    }
 
     println!("\tI²C path: {}", monitor.path);
 
