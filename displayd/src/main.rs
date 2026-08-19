@@ -69,7 +69,7 @@ impl From<&EdidData> for MonitorEdidInfo {
     fn from(edid: &EdidData) -> Self {
         Self {
             manufacturer: edid.id.clone(),
-            company_name: edid.manifacturer.clone(),
+            company_name: edid.manufacturer.clone(),
             name: edid.name.clone(),
             product_code: edid.product_code,
             serial_number: edid.serial_number,

@@ -15,7 +15,7 @@ pub enum ProductionDate {
 #[derive(Debug, Clone)]
 pub struct EdidData {
     pub id: String,
-    pub manifacturer: Option<String>,
+    pub manufacturer: Option<String>,
     pub name: Option<String>,
     pub product_code: u16,
     pub serial_number: u32,
@@ -65,7 +65,7 @@ pub fn parse(edid: &[u8]) -> Result<EdidData, Error> {
 
     Ok(EdidData {
         id,
-        manifacturer: get_name(&id),
+        manufacturer: get_name(&id),
         name,
         product_code,
         serial_number,
