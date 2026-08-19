@@ -27,6 +27,7 @@ enum ProductionDateInfo {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct MonitorEdidInfo {
     manufacturer: String,
+    company_name: Option<String>,
     name: Option<String>,
     product_code: u16,
     serial_number: u32,
@@ -398,7 +399,7 @@ fn info(monitor: Option<String>, json: bool) -> Result<()> {
     println!("Monitor information:");
     println!("\tConnector: {}", monitor.connector);
     println!("\tName: {}", monitor.name.as_deref().unwrap_or("Unknown"));
-    println!("\tManufacturer: {}", monitor.id.manufacturer);
+    println!("\tManufacturer: {}{}", monitor.id.manufacturer, monitor.edid_data.company_name.as_ref().map(|name| format!(" - {}", name)).unwrap_or_default());
     println!("\tProduct code: 0x{:04x} ({})", monitor.id.product, monitor.id.product);
 
     match monitor.id.serial {

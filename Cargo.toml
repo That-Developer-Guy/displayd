@@ -1,3 +1,16 @@
+[package]
+name = "project-tools"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+scripts = []
+
+[[bin]]
+name = "update-pnp"
+path = "scripts/generate_pnp.rs"
+required-features = ["scripts"]
+
 [workspace]
 resolver = "2"
 

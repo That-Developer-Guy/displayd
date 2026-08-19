@@ -57,6 +57,7 @@ enum ProductionDateInfo {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct MonitorEdidInfo {
     manufacturer: String,
+    company_name: Option<String>,
     name: Option<String>,
     product_code: u16,
     edid_version: String,
@@ -68,6 +69,7 @@ impl From<&EdidData> for MonitorEdidInfo {
     fn from(edid: &EdidData) -> Self {
         Self {
             manufacturer: edid.id.clone(),
+            company_name: edid.manifacturer.clone(),
             name: edid.name.clone(),
             product_code: edid.product_code,
             serial_number: edid.serial_number,
